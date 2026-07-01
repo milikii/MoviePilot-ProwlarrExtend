@@ -2,11 +2,8 @@
 import copy
 import traceback
 from typing import List, Dict, Any, Tuple, Optional
-from datetime import datetime, timedelta
 from urllib.parse import urlencode, quote_plus
 
-import pytz
-from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from app.helper.sites import SitesHelper
 
@@ -27,7 +24,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "1.3"
+    plugin_version = "2.0"
     # 插件作者
     plugin_author = "jtcymc"
     # 作者主页
@@ -38,73 +35,59 @@ class ProwlarrExtend(_PluginBase):
     plugin_order = 16
     # 可使用的用户级别
     auth_level = 1
-    # 私有属性
-    _scheduler = None
-    _cron = None
-    _enabled = False
-    _proxy = False
-    _host = ""
-    _api_key = ""
-    _onlyonce = False
-    _indexers = []
-    sites_helper = None
     # 仅用于标识，避免重复注册
     prowlarr_domain = "prowlarr_extend.jtcymc"
 
     def init_plugin(self, config: dict = None):
-        """
-        初始化插件
-        """
         self.sites_helper = SitesHelper()
-        # 读取配置
+        self._indexers = []
+        self._cron = None
+        self._enabled = False
+        self._proxy = False
+        self._host = ""
+        self._api_key = ""
+        self._onlyonce = False
+
         if config:
-            self._host = config.get("host")
+            self._host = config.get("host", "")
             if self._host:
                 if not self._host.startswith('http'):
                     self._host = "http://" + self._host
                 if self._host.endswith('/'):
                     self._host = self._host.rstrip('/')
-            self._api_key = config.get("api_key")
-            self._enabled = config.get("enabled")
-            self._proxy = config.get("proxy")
-            self._onlyonce = config.get("onlyonce")
+            self._api_key = config.get("api_key", "")
+            self._enabled = config.get("enabled", False)
+            self._proxy = config.get("proxy", False)
+            self._onlyonce = config.get("onlyonce", False)
             self._cron = config.get("cron") or "0 0 */24 * *"
 
-        # 停止现有任务
-        self.stop_service()
-        # 启动定时任务 & 立即运行一次
-        self._scheduler = BackgroundScheduler(timezone=settings.TZ)
-        if self._cron:
-            logger.info(f"【{self.plugin_name}】 索引更新服务启动，周期：{self._cron}")
-            self._scheduler.add_job(self.get_status, CronTrigger.from_crontab(self._cron))
-
         if self._onlyonce:
-            logger.info(f"【{self.plugin_name}】开始获取索引器状态")
-            self._scheduler.add_job(self.get_status, 'date',
-                                    run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3))
-            # 关闭一次性开关
+            logger.info(f"【{self.plugin_name}】立即获取索引器状态")
+            self.get_status()
             self._onlyonce = False
             self.__update_config()
 
-        if self._cron or self._onlyonce:
-            # 启动服务
-            self._scheduler.print_jobs()
-            self._scheduler.start()
         if not self._indexers:
             self.get_status()
+
         for indexer in self._indexers:
             domain = indexer.get("domain", "")
             site_info = self.sites_helper.get_indexer(domain)
             if not site_info:
-                new_indexer = copy.deepcopy(indexer)
-                # sites_helper 添加prowlarr_indexer
-                self.sites_helper.add_indexer(domain, new_indexer)
+                self.sites_helper.add_indexer(domain, copy.deepcopy(indexer))
+
+    def get_service(self) -> List[Dict[str, Any]]:
+        if self._enabled and self._cron:
+            return [{
+                "id": "ProwlarrExtendRefresh",
+                "name": "Prowlarr 索引刷新",
+                "trigger": CronTrigger.from_crontab(self._cron),
+                "func": self.get_status,
+                "kwargs": {}
+            }]
+        return []
 
     def get_status(self):
-        """
-        检查连通性
-        :return: True、False
-        """
         if not self._api_key or not self._host:
             return False
         self._indexers = self.get_indexers()
@@ -114,68 +97,39 @@ class ProwlarrExtend(_PluginBase):
         return self._enabled
 
     def stop_service(self):
-        """
-        退出插件
-        """
-        try:
-            if self._scheduler:
-                self._scheduler.remove_all_jobs()
-                if self._scheduler.running:
-                    self._scheduler.shutdown()
-                self._scheduler = None
-        except Exception as e:
-            logger.error(f"【{self.plugin_name}】停止插件错误: {str(e)}")
+        pass
 
     def __update_config(self):
-        """
-        更新插件配置
-        """
         self.update_config({
             "onlyonce": False,
             "cron": self._cron,
             "host": self._host,
-            "api_key": self._api_key
+            "api_key": self._api_key,
+            "enabled": self._enabled,
+            "proxy": self._proxy,
         })
 
     def get_api(self) -> List[Dict[str, Any]]:
-        """
-        获取插件API
-        [{
-            "path": "/xx",
-            "endpoint": self.xxx,
-            "methods": ["GET", "POST"],
-            "summary": "API说明"
-        }]
-        """
-        pass
+        return []
 
     def get_module(self) -> Dict[str, Any]:
-        """
-        获取插件模块声明，用于胁持系统模块实现（方法名：方法实现）
-        {
-            "id1": self.xxx1,
-            "id2": self.xxx2,
-        }
-        """
         return {
             "search_torrents": self.search_torrents,
         }
 
     def get_indexers(self):
-        """
-        获取配置的 Prowlarr Indexer 信息
-
-        :return: Indexer 列表，包含 id, name, url, domain, public, proxy 信息
-        """
         headers = {
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "User-Agent": settings.USER_AGENT,
             "X-Api-Key": self._api_key,
             "Accept": "application/json, text/javascript, */*; q=0.01"
         }
-        indexer_query_url = f"{self._host.rstrip('/')}/api/v1/indexerstats"
+        indexer_query_url = f"{self._host}/api/v1/indexerstats"
         try:
-            ret = RequestUtils(headers=headers).get_res(indexer_query_url)
+            ret = RequestUtils(
+                headers=headers,
+                proxies=settings.PROXY if self._proxy else None
+            ).get_res(indexer_query_url)
             if not ret:
                 logger.warning(f"【{self.plugin_name}】获取 indexer 请求无响应")
                 return []
@@ -200,10 +154,10 @@ class ProwlarrExtend(_PluginBase):
                 indexers.append({
                     "id": f'{self.plugin_name}-{indexer_name}',
                     "name": f'{self.plugin_name}-{indexer_name}',
-                    "url": f'{self._host.rstrip("/")}/api/v1/indexer/{indexer_id}',
+                    "url": f'{self._host}/api/v1/indexer/{indexer_id}',
                     "domain": self.prowlarr_domain.replace(self.plugin_author, str(indexer_id)),
                     "public": True,
-                    "proxy": False,
+                    "proxy": self._proxy,
                 })
 
             return indexers
@@ -212,11 +166,7 @@ class ProwlarrExtend(_PluginBase):
             return []
 
     def search_torrents(self, site: dict, keyword: str, mtype: Optional[MediaType] = None, page: Optional[int] = 0) -> \
-            List[
-                TorrentInfo]:
-        """
-        根据关键字检索种子
-        """
+            List[TorrentInfo]:
         results = []
 
         if not site or not keyword:
@@ -225,14 +175,14 @@ class ProwlarrExtend(_PluginBase):
         if site.get("name", "").split("-")[0] != self.plugin_name:
             return results
 
-        # 提取 Indexer ID
         domain = StringUtils.get_url_domain(site.get("domain", ""))
         indexer_id = domain.split(".")[-1] if domain else ""
         if not indexer_id:
             logger.warning(f"【{self.plugin_name}】无法提取索引 ID，跳过站点：{site.get('name')}")
             return results
 
-        # 构建请求头
+        site_name = site.get("name", "").replace(f"{self.plugin_name}-", "", 1)
+
         headers = {
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "User-Agent": settings.USER_AGENT,
@@ -250,9 +200,12 @@ class ProwlarrExtend(_PluginBase):
                          ("offset", page * 150 if page else 0),
                      ] + [("categories", cat) for cat in categories]
             query_string = urlencode(params, quote_via=quote_plus)
-            api_url = f"{self._host.rstrip('/')}/api/v1/search?{query_string}"
+            api_url = f"{self._host}/api/v1/search?{query_string}"
 
-            response = RequestUtils(headers=headers).get_res(api_url)
+            response = RequestUtils(
+                headers=headers,
+                proxies=settings.PROXY if self._proxy else None
+            ).get_res(api_url)
             if not response:
                 logger.warning(f"【{self.plugin_name}】{site.get('name')} 返回为空")
                 return results
@@ -263,14 +216,22 @@ class ProwlarrExtend(_PluginBase):
                 return results
 
             for entry in data:
+                cat_labels = [c.get("name") for c in entry.get("categories", []) if c.get("name")]
                 torrent = TorrentInfo(
                     title=entry.get("title"),
                     enclosure=entry.get("downloadUrl") or entry.get("magnetUrl"),
                     description=entry.get("sortTitle"),
                     size=entry.get("size"),
                     seeders=entry.get("seeders"),
+                    peers=entry.get("leechers"),
+                    grabs=entry.get("grabs"),
                     pubdate=entry.get("publishDate"),
                     page_url=entry.get("infoUrl") or entry.get("guid"),
+                    site_name=site_name,
+                    labels=cat_labels,
+                    category=self._infer_category(entry.get("categories", [])),
+                    downloadvolumefactor=1.0,
+                    uploadvolumefactor=1.0,
                 )
                 results.append(torrent)
 
@@ -278,6 +239,16 @@ class ProwlarrExtend(_PluginBase):
             logger.error(f"【{self.plugin_name}】检索错误：{str(e)}\n{traceback.format_exc()}")
 
         return results
+
+    @staticmethod
+    def _infer_category(categories: list) -> str:
+        for cat in categories:
+            cat_id = cat.get("id", 0)
+            if 2000 <= cat_id < 3000:
+                return "电影"
+            elif 5000 <= cat_id < 6000:
+                return "电视剧"
+        return ""
 
     @staticmethod
     def get_cat(mtype: Optional[MediaType] = None):
@@ -291,9 +262,6 @@ class ProwlarrExtend(_PluginBase):
             return [2000, 5000]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """
-        拼装插件配置页面，需要返回两块数据：1、页面配置；2、数据结构
-        """
         return [
             {
                 'component': 'VForm',
@@ -391,7 +359,7 @@ class ProwlarrExtend(_PluginBase):
                                             'model': 'host',
                                             'label': 'Prowlarr地址',
                                             'placeholder': 'http://127.0.0.1:9696',
-                                            'hint': 'Prowlarr访问地址和端口，如为https需加https://前缀。注意需要先在Prowlarr中添加搜刮器，同时勾选所有搜刮器后搜索一次，才能正常测试通过和使用'
+                                            'hint': 'Prowlarr访问地址和端口，如为https需加https://前缀'
                                         }
                                     }
                                 ]
@@ -409,28 +377,8 @@ class ProwlarrExtend(_PluginBase):
                                             'model': 'api_key',
                                             'label': 'Api Key',
                                             'placeholder': '',
-                                            'hint': '在Prowlarr->Settings->General->Security-> API Key中获取'
+                                            'hint': '在Prowlarr->Settings->General->Security->API Key中获取'
                                         }
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VRow',
-                        'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VAlert',
-                                        'props': {
-                                            'type': 'success',
-                                            'variant': 'tonal',
-                                            'text': '将“查看数据”列表中 “站点domain” => 站点管理 新增站点 站点名+ https://或http:// 直接新增'}
                                     }
                                 ]
                             }
@@ -450,42 +398,31 @@ class ProwlarrExtend(_PluginBase):
                                         'props': {
                                             'type': 'info',
                                             'variant': 'tonal',
-                                            'text': '该种方式扩建检索，无法进行站点连通性监测，官方默认方式添加的正常不影响！'
-                                                    '日志出现报如下错误时，可以不用管，由于插件没有检索到数据会触发后续模块检索，导致错误'
-                                                    'indexer - 【ProwlarrExtend】ACG.RIP 搜索出错：NoneType object has no attribute get'
+                                            'text': '请先在Prowlarr中添加索引器并确保其正常工作，然后在此配置地址和API Key即可。'
                                         }
                                     }
                                 ]
                             }
                         ]
                     }
-
                 ]
             }
         ], {
             "host": "",
             "api_key": "",
             "cron": "0 0 */24 * *",
+            "enabled": False,
+            "proxy": False,
             "onlyonce": False
         }
 
     def _ensure_sites_loaded(self) -> bool:
-        """
-        确保 self._indexers 已加载数据，若为空则尝试重新加载。
-        :return: 成功加载返回 True，否则 False
-        """
         if isinstance(self._indexers, list) and len(self._indexers) > 0:
             return True
-
-        # 尝试重新加载站点数据
         self.get_status()
-
         return isinstance(self._indexers, list) and len(self._indexers) > 0
 
     def get_page(self) -> List[dict]:
-        """
-        拼装插件详情页面，需要返回页面配置，同时附带数据
-        """
         if not self._ensure_sites_loaded():
             return []
 
