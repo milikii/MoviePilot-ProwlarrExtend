@@ -13,7 +13,6 @@ from app.core.config import settings
 from app.schemas import MediaType
 from app.utils.http import RequestUtils
 from app.log import logger
-from app.utils.string import StringUtils
 
 
 class ProwlarrExtend(_PluginBase):
@@ -35,8 +34,8 @@ class ProwlarrExtend(_PluginBase):
     plugin_order = 16
     # 可使用的用户级别
     auth_level = 1
-    # 仅用于标识，避免重复注册
-    prowlarr_domain = "prowlarr_extend.jtcymc"
+    # 虚拟站点域名后缀，索引器 ID 作为子域，形如 "15.prowlarr.extend"
+    prowlarr_domain = "prowlarr.extend"
 
     def init_plugin(self, config: dict = None):
         self.sites_helper = SitesHelper()
@@ -70,11 +69,17 @@ class ProwlarrExtend(_PluginBase):
         if not self._indexers:
             self.get_status()
 
+        registered = 0
         for indexer in self._indexers:
             domain = indexer.get("domain", "")
             site_info = self.sites_helper.get_indexer(domain)
             if not site_info:
                 self.sites_helper.add_indexer(domain, copy.deepcopy(indexer))
+                registered += 1
+        logger.info(
+            f"【{self.plugin_name}】索引器加载完成，共 {len(self._indexers)} 个，"
+            f"本次注册 {registered} 个虚拟站点"
+        )
 
     def get_service(self) -> List[Dict[str, Any]]:
         if self._enabled and self._cron:
@@ -155,11 +160,12 @@ class ProwlarrExtend(_PluginBase):
                     "id": f'{self.plugin_name}-{indexer_name}',
                     "name": f'{self.plugin_name}-{indexer_name}',
                     "url": f'{self._host}/api/v1/indexer/{indexer_id}',
-                    "domain": self.prowlarr_domain.replace(self.plugin_author, str(indexer_id)),
+                    "domain": f'{indexer_id}.{self.prowlarr_domain}',
                     "public": True,
                     "proxy": self._proxy,
                 })
 
+            logger.info(f"【{self.plugin_name}】从 Prowlarr 获取到 {len(indexers)} 个索引器")
             return indexers
         except Exception as e:
             logger.error(f"【{self.plugin_name}】获取 indexer 失败：{str(e)}")
@@ -175,10 +181,11 @@ class ProwlarrExtend(_PluginBase):
         if site.get("name", "").split("-")[0] != self.plugin_name:
             return results
 
-        domain = StringUtils.get_url_domain(site.get("domain", ""))
-        indexer_id = domain.split(".")[-1] if domain else ""
-        if not indexer_id:
-            logger.warning(f"【{self.plugin_name}】无法提取索引 ID，跳过站点：{site.get('name')}")
+        # 域名形如 "15.prowlarr.extend"，索引器 ID 是第一段
+        raw_domain = site.get("domain", "")
+        indexer_id = raw_domain.split(".")[0] if raw_domain else ""
+        if not indexer_id or not indexer_id.isdigit():
+            logger.warning(f"【{self.plugin_name}】无法提取索引 ID，跳过站点：{site.get('name')}（domain={raw_domain}）")
             return results
 
         site_name = site.get("name", "").replace(f"{self.plugin_name}-", "", 1)
