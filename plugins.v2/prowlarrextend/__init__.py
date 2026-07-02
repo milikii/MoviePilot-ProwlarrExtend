@@ -2,16 +2,18 @@
 import copy
 import traceback
 from typing import List, Dict, Any, Tuple, Optional
-from urllib.parse import urlencode, quote_plus
+from urllib.parse import urlencode, quote_plus, urlparse
 
 from apscheduler.triggers.cron import CronTrigger
+from fastapi.concurrency import run_in_threadpool
 from app.helper.sites import SitesHelper
 
 from app.core.context import TorrentInfo
+from app.db.models.site import Site
 from app.plugins import _PluginBase
 from app.core.config import settings
 from app.schemas import MediaType
-from app.schemas.types import SystemConfigKey
+from app.schemas.types import EventType, SystemConfigKey
 from app.utils.http import RequestUtils
 from app.log import logger
 
@@ -24,7 +26,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "2.1"
+    plugin_version = "2.2"
     # 插件作者
     plugin_author = "milikii"
     # 作者主页
@@ -35,8 +37,8 @@ class ProwlarrExtend(_PluginBase):
     plugin_order = 16
     # 可使用的用户级别
     auth_level = 1
-    # 虚拟站点域名后缀，索引器 ID 作为子域，形如 "15.prowlarr.extend"
-    prowlarr_domain = "prowlarr.extend"
+    # 虚拟站点域名，索引器 ID 放在主域中，避免 MoviePilot 将数字子域规范化掉。
+    prowlarr_domain_suffix = "extend"
 
     def init_plugin(self, config: dict = None):
         self.sites_helper = SitesHelper()
@@ -81,7 +83,8 @@ class ProwlarrExtend(_PluginBase):
             elif site_info.get("id") != indexer.get("id") or site_info.get("url") != indexer.get("url"):
                 self.sites_helper.add_indexer(domain, copy.deepcopy(indexer))
                 updated += 1
-        self.__sync_search_sites()
+        site_ids = self.__sync_site_records()
+        self.__sync_search_sites(site_ids)
         logger.info(
             f"【{self.plugin_name}】索引器加载完成，共 {len(self._indexers)} 个，"
             f"本次注册 {registered} 个、更新 {updated} 个虚拟站点"
@@ -137,6 +140,7 @@ class ProwlarrExtend(_PluginBase):
     def get_module(self) -> Dict[str, Any]:
         return {
             "search_torrents": self.search_torrents,
+            "async_search_torrents": self.async_search_torrents,
         }
 
     def get_indexers(self):
@@ -177,7 +181,7 @@ class ProwlarrExtend(_PluginBase):
                     "id": f'{self.plugin_name}-{indexer_id}',
                     "name": f'{self.plugin_name}-{indexer_name}',
                     "url": f'{self._host}/api/v1/indexer/{indexer_id}',
-                    "domain": f'{indexer_id}.{self.prowlarr_domain}',
+                    "domain": self.__build_domain(indexer_id),
                     "public": True,
                     "proxy": self._proxy,
                 })
@@ -262,6 +266,16 @@ class ProwlarrExtend(_PluginBase):
 
         return results
 
+    async def async_search_torrents(self, site: dict, keyword: str, mtype: Optional[MediaType] = None,
+                                    page: Optional[int] = 0) -> List[TorrentInfo]:
+        return await run_in_threadpool(
+            self.search_torrents,
+            site=site,
+            keyword=keyword,
+            mtype=mtype,
+            page=page,
+        )
+
     @staticmethod
     def _infer_category(categories: list) -> str:
         for cat in categories:
@@ -284,11 +298,19 @@ class ProwlarrExtend(_PluginBase):
             return [2000, 5000]
 
     def __get_indexer_id(self, site: dict) -> str:
-        # 域名形如 "15.prowlarr.extend"，索引器 ID 是第一段。
+        # 新域名形如 "prowlarr-15.extend"，兼容旧域名 "15.prowlarr.extend"。
         raw_domain = site.get("domain", "")
-        domain_indexer_id = raw_domain.split(".")[0] if raw_domain else ""
-        if domain_indexer_id.isdigit():
-            return domain_indexer_id
+        if raw_domain and "://" in raw_domain:
+            raw_domain = urlparse(raw_domain).hostname or raw_domain
+        raw_domain = raw_domain.strip("/")
+        if raw_domain.startswith("prowlarr-"):
+            domain_indexer_id = raw_domain.split(".", 1)[0].replace("prowlarr-", "", 1)
+            if domain_indexer_id.isdigit():
+                return domain_indexer_id
+        if raw_domain:
+            domain_indexer_id = raw_domain.split(".")[0]
+            if domain_indexer_id.isdigit():
+                return domain_indexer_id
 
         site_id = str(site.get("id", ""))
         id_prefix = f"{self.plugin_name}-"
@@ -305,7 +327,73 @@ class ProwlarrExtend(_PluginBase):
 
         return ""
 
-    def __sync_search_sites(self):
+    def __build_domain(self, indexer_id) -> str:
+        return f"prowlarr-{indexer_id}.{self.prowlarr_domain_suffix}"
+
+    def __legacy_domain(self, indexer_id) -> str:
+        return f"{indexer_id}.prowlarr.extend"
+
+    def __sync_site_records(self) -> List[int]:
+        if not self._enabled or not self._indexers:
+            return []
+
+        current_domains = {indexer.get("domain") for indexer in self._indexers if indexer.get("domain")}
+        site_ids = []
+        created = 0
+        updated = 0
+        removed = 0
+
+        for indexer in self._indexers:
+            domain = indexer.get("domain")
+            if not domain:
+                continue
+
+            payload = {
+                "name": indexer.get("name"),
+                "domain": domain,
+                "url": f"https://{domain}/",
+                "pri": 0,
+                "public": 1 if indexer.get("public") else 0,
+                "proxy": 1 if self._proxy else 0,
+                "render": 0,
+                "timeout": 15,
+                "is_active": True,
+            }
+
+            site = Site.get_by_domain(None, domain)
+            if not site:
+                Site(**payload).create(None)
+                site = Site.get_by_domain(None, domain)
+                created += 1
+            else:
+                update_payload = {
+                    key: value
+                    for key, value in payload.items()
+                    if getattr(site, key, None) != value
+                }
+                if update_payload:
+                    site.update(None, update_payload)
+                    site = Site.get_by_domain(None, domain)
+                    updated += 1
+
+            if site and site.id:
+                site_ids.append(site.id)
+
+            indexer_id = self.__get_indexer_id(indexer)
+            legacy_site = Site.get_by_domain(None, self.__legacy_domain(indexer_id)) if indexer_id else None
+            if legacy_site and legacy_site.domain not in current_domains:
+                Site.delete(None, legacy_site.id)
+                removed += 1
+
+        if created or updated or removed:
+            self.eventmanager.send_event(EventType.SiteUpdated, {"plugin_id": self.plugin_name})
+            logger.info(
+                f"【{self.plugin_name}】同步正式站点：新增 {created} 个、更新 {updated} 个、清理旧站点 {removed} 个"
+            )
+
+        return site_ids
+
+    def __sync_search_sites(self, site_ids: List[int]):
         if not self._enabled or not self._indexers:
             return
 
@@ -313,29 +401,25 @@ class ProwlarrExtend(_PluginBase):
         if not selected_sites:
             return
 
-        prowlarr_ids = [
-            indexer.get("id")
-            for indexer in self._indexers
-            if indexer.get("id")
-        ]
-        if not prowlarr_ids:
+        if not site_ids:
             return
 
         cleaned_sites = [
             site_id
             for site_id in selected_sites
             if not (isinstance(site_id, str) and site_id.startswith(f"{self.plugin_name}-"))
+            and site_id not in site_ids
         ]
         missing_ids = [
             site_id
-            for site_id in prowlarr_ids
+            for site_id in site_ids
             if site_id not in cleaned_sites
         ]
         if not missing_ids and cleaned_sites == selected_sites:
             return
 
         self.systemconfig.set(SystemConfigKey.IndexerSites, cleaned_sites + missing_ids)
-        logger.info(f"【{self.plugin_name}】已同步 {len(prowlarr_ids)} 个虚拟站点到搜索站点范围")
+        logger.info(f"【{self.plugin_name}】已同步 {len(site_ids)} 个正式站点到搜索站点范围")
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [
