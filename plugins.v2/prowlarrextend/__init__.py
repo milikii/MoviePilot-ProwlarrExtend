@@ -11,6 +11,7 @@ from app.core.context import TorrentInfo
 from app.plugins import _PluginBase
 from app.core.config import settings
 from app.schemas import MediaType
+from app.schemas.types import SystemConfigKey
 from app.utils.http import RequestUtils
 from app.log import logger
 
@@ -23,7 +24,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "2.0"
+    plugin_version = "2.1"
     # 插件作者
     plugin_author = "milikii"
     # 作者主页
@@ -70,15 +71,20 @@ class ProwlarrExtend(_PluginBase):
             self.get_status()
 
         registered = 0
+        updated = 0
         for indexer in self._indexers:
             domain = indexer.get("domain", "")
             site_info = self.sites_helper.get_indexer(domain)
             if not site_info:
                 self.sites_helper.add_indexer(domain, copy.deepcopy(indexer))
                 registered += 1
+            elif site_info.get("id") != indexer.get("id") or site_info.get("url") != indexer.get("url"):
+                self.sites_helper.add_indexer(domain, copy.deepcopy(indexer))
+                updated += 1
+        self.__sync_search_sites()
         logger.info(
             f"【{self.plugin_name}】索引器加载完成，共 {len(self._indexers)} 个，"
-            f"本次注册 {registered} 个虚拟站点"
+            f"本次注册 {registered} 个、更新 {updated} 个虚拟站点"
         )
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -94,6 +100,11 @@ class ProwlarrExtend(_PluginBase):
 
     def get_status(self):
         if not self._api_key or not self._host:
+            logger.warning(
+                f"【{self.plugin_name}】get_status 提前返回："
+                f"host={'有' if self._host else '空'}, "
+                f"api_key={'有' if self._api_key else '空'}"
+            )
             return False
         self._indexers = self.get_indexers()
         return True if isinstance(self._indexers, list) and len(self._indexers) > 0 else False
@@ -105,11 +116,17 @@ class ProwlarrExtend(_PluginBase):
         pass
 
     def __update_config(self):
+        saved_config = self.get_config() or {}
+        host = self._host or saved_config.get("host", "")
+        api_key = self._api_key or saved_config.get("api_key", "")
+        if (not self._host or not self._api_key) and (saved_config.get("host") or saved_config.get("api_key")):
+            logger.warning(f"【{self.plugin_name}】当前 Prowlarr 配置为空，保留已保存的 host/api_key，避免覆盖有效配置")
+
         self.update_config({
             "onlyonce": False,
             "cron": self._cron,
-            "host": self._host,
-            "api_key": self._api_key,
+            "host": host,
+            "api_key": api_key,
             "enabled": self._enabled,
             "proxy": self._proxy,
         })
@@ -157,7 +174,7 @@ class ProwlarrExtend(_PluginBase):
                     continue
 
                 indexers.append({
-                    "id": f'{self.plugin_name}-{indexer_name}',
+                    "id": f'{self.plugin_name}-{indexer_id}',
                     "name": f'{self.plugin_name}-{indexer_name}',
                     "url": f'{self._host}/api/v1/indexer/{indexer_id}',
                     "domain": f'{indexer_id}.{self.prowlarr_domain}',
@@ -181,11 +198,9 @@ class ProwlarrExtend(_PluginBase):
         if site.get("name", "").split("-")[0] != self.plugin_name:
             return results
 
-        # 域名形如 "15.prowlarr.extend"，索引器 ID 是第一段
-        raw_domain = site.get("domain", "")
-        indexer_id = raw_domain.split(".")[0] if raw_domain else ""
+        indexer_id = self.__get_indexer_id(site)
         if not indexer_id or not indexer_id.isdigit():
-            logger.warning(f"【{self.plugin_name}】无法提取索引 ID，跳过站点：{site.get('name')}（domain={raw_domain}）")
+            logger.warning(f"【{self.plugin_name}】无法提取索引 ID，跳过站点：{site.get('name')}（domain={site.get('domain')}）")
             return results
 
         site_name = site.get("name", "").replace(f"{self.plugin_name}-", "", 1)
@@ -267,6 +282,60 @@ class ProwlarrExtend(_PluginBase):
             return [5000]
         else:
             return [2000, 5000]
+
+    def __get_indexer_id(self, site: dict) -> str:
+        # 域名形如 "15.prowlarr.extend"，索引器 ID 是第一段。
+        raw_domain = site.get("domain", "")
+        domain_indexer_id = raw_domain.split(".")[0] if raw_domain else ""
+        if domain_indexer_id.isdigit():
+            return domain_indexer_id
+
+        site_id = str(site.get("id", ""))
+        id_prefix = f"{self.plugin_name}-"
+        if site_id.startswith(id_prefix):
+            id_indexer_id = site_id.replace(id_prefix, "", 1)
+            if id_indexer_id.isdigit():
+                return id_indexer_id
+
+        url = site.get("url", "")
+        if "/indexer/" in url:
+            url_indexer_id = url.rstrip("/").rsplit("/", 1)[-1]
+            if url_indexer_id.isdigit():
+                return url_indexer_id
+
+        return ""
+
+    def __sync_search_sites(self):
+        if not self._enabled or not self._indexers:
+            return
+
+        selected_sites = self.systemconfig.get(SystemConfigKey.IndexerSites) or []
+        if not selected_sites:
+            return
+
+        prowlarr_ids = [
+            indexer.get("id")
+            for indexer in self._indexers
+            if indexer.get("id")
+        ]
+        if not prowlarr_ids:
+            return
+
+        cleaned_sites = [
+            site_id
+            for site_id in selected_sites
+            if not (isinstance(site_id, str) and site_id.startswith(f"{self.plugin_name}-"))
+        ]
+        missing_ids = [
+            site_id
+            for site_id in prowlarr_ids
+            if site_id not in cleaned_sites
+        ]
+        if not missing_ids and cleaned_sites == selected_sites:
+            return
+
+        self.systemconfig.set(SystemConfigKey.IndexerSites, cleaned_sites + missing_ids)
+        logger.info(f"【{self.plugin_name}】已同步 {len(prowlarr_ids)} 个虚拟站点到搜索站点范围")
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [

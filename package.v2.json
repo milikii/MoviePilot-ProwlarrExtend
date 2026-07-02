@@ -3,7 +3,7 @@
     "name": "ProwlarrExtend",
     "description": "扩展检索以支持Prowlarr站点资源",
     "labels": "索引器,Prowlarr",
-    "version": "2.0",
+    "version": "2.1",
     "icon": "Prowlarr.png",
     "author": "milikii",
     "level": 1,
@@ -13,7 +13,8 @@
       "v1.1.1": "修复链接取值",
       "v1.2": "修复已知问题",
       "v1.3": "适配MoviePilot v2.6.8及以后的版本",
-      "v2.0": "修复代理传递、补全TorrentInfo字段、迁移到get_service()定时任务"
+      "v2.0": "修复代理传递、补全TorrentInfo字段、迁移到get_service()定时任务",
+      "v2.1": "修复空配置覆盖、虚拟站点默认搜索范围和索引器ID提取"
     }
   }
 }
