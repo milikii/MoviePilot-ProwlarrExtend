@@ -21,7 +21,7 @@ class SubtitleHunter(_PluginBase):
     plugin_name = "SubtitleHunter"
     plugin_desc = "资源入库后自动遍历所有PT站点搜索并下载中文字幕"
     plugin_icon = "subtitle.png"
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     plugin_author = "milikii"
     author_url = "https://github.com/milikii"
     plugin_config_prefix = "subtitle_hunter_"
@@ -36,11 +36,101 @@ class SubtitleHunter(_PluginBase):
     def init_plugin(self, config: dict = None):
         self._enabled = False
         self._notify = True
-        self._delay = 30
+        self._onlyonce = False
+        self._target_path = ""
         if config:
             self._enabled = config.get("enabled", False)
             self._notify = config.get("notify", True)
-            self._delay = int(config.get("delay", 30))
+            self._onlyonce = config.get("onlyonce", False)
+            self._target_path = config.get("target_path", "")
+
+        if self._onlyonce:
+            self._onlyonce = False
+            self.update_config({
+                "enabled": self._enabled,
+                "notify": self._notify,
+                "onlyonce": False,
+                "target_path": self._target_path,
+            })
+            if self._target_path:
+                threading.Thread(
+                    target=self._run_once,
+                    args=(self._target_path,),
+                    daemon=True,
+                    name="SubtitleHunter-RunOnce",
+                ).start()
+            else:
+                logger.warning(f"【{self.plugin_name}】运行一次：未指定媒体目录路径")
+
+    def _run_once(self, target_path: str):
+        """
+        手动运行一次：对指定媒体目录搜索中文字幕。
+        """
+        target_dir = Path(target_path)
+        logger.info(f"【{self.plugin_name}】手动运行：目标目录 {target_dir}")
+
+        if not target_dir.exists():
+            logger.error(f"【{self.plugin_name}】目标目录不存在：{target_dir}")
+            return
+
+        if self._has_chinese_subtitle(target_dir):
+            logger.info(f"【{self.plugin_name}】{target_dir.name} 已有中文字幕，跳过")
+            return
+
+        logger.info(f"【{self.plugin_name}】{target_dir.name} 未找到中文字幕，开始全站搜索...")
+
+        keyword = target_dir.name
+        # 尝试从 nfo 文件提取 IMDB ID
+        for nfo in target_dir.glob("*.nfo"):
+            try:
+                content = nfo.read_text(encoding="utf-8", errors="ignore")
+                match = re.search(r"(tt\d{7,})", content)
+                if match:
+                    keyword = match.group(1)
+                    logger.info(f"【{self.plugin_name}】从 nfo 提取到 IMDB ID：{keyword}")
+                    break
+            except Exception:
+                pass
+
+        sites = SitesHelper().get_indexers()
+        if not sites:
+            logger.warning(f"【{self.plugin_name}】无可用站点")
+            return
+
+        logger.info(f"【{self.plugin_name}】搜索关键词：{keyword}，站点数：{len(sites)}")
+
+        search_chain = SearchChain()
+        all_subtitles: List[SubtitleInfo] = []
+
+        for site in sites:
+            site_name = site.get("name", "未知")
+            try:
+                results = search_chain.search_subtitles(
+                    site=site, keyword=keyword, page=0
+                )
+                if results:
+                    logger.info(f"【{self.plugin_name}】{site_name} 返回 {len(results)} 条字幕")
+                    all_subtitles.extend(results)
+            except Exception as e:
+                logger.debug(f"【{self.plugin_name}】{site_name} 搜索字幕异常：{e}")
+
+        chinese_subs = [s for s in all_subtitles if self._is_chinese_subtitle(s)]
+
+        if not chinese_subs:
+            logger.info(
+                f"【{self.plugin_name}】全站搜索完成，共 {len(all_subtitles)} 条字幕，无中文字幕"
+            )
+            return
+
+        chinese_subs.sort(key=lambda s: s.grabs or 0, reverse=True)
+        best = chinese_subs[0]
+
+        logger.info(
+            f"【{self.plugin_name}】找到 {len(chinese_subs)} 条中文字幕，"
+            f"选择：{best.title}（来源：{best.site_name}，下载次数：{best.grabs}）"
+        )
+
+        self._download_subtitle(best, target_dir)
 
     def get_state(self) -> bool:
         return self._enabled
@@ -59,9 +149,6 @@ class SubtitleHunter(_PluginBase):
 
     @eventmanager.register(EventType.TransferComplete)
     def on_transfer_complete(self, event: Event):
-        """
-        资源整理完成后，检查是否缺少中文字幕，缺少则遍历全站搜索下载。
-        """
         if not self._enabled:
             return
 
@@ -86,9 +173,6 @@ class SubtitleHunter(_PluginBase):
         ).start()
 
     def _search_and_download(self, mediainfo: MediaInfo, target_dir: Path):
-        """
-        在后台线程中遍历全站搜索中文字幕并下载到目标目录。
-        """
         try:
             if self._has_chinese_subtitle(target_dir):
                 logger.info(f"【{self.plugin_name}】{mediainfo.title_year} 已有中文字幕，跳过")
@@ -106,24 +190,24 @@ class SubtitleHunter(_PluginBase):
                 logger.warning(f"【{self.plugin_name}】无可用站点")
                 return
 
+            logger.info(f"【{self.plugin_name}】搜索关键词：{keyword}，站点数：{len(sites)}")
+
             search_chain = SearchChain()
             all_subtitles: List[SubtitleInfo] = []
 
             for site in sites:
+                site_name = site.get("name", "未知")
                 try:
                     results = search_chain.search_subtitles(
                         site=site, keyword=keyword, page=0
                     )
                     if results:
+                        logger.info(f"【{self.plugin_name}】{site_name} 返回 {len(results)} 条字幕")
                         all_subtitles.extend(results)
                 except Exception as e:
-                    logger.debug(
-                        f"【{self.plugin_name}】站点 {site.get('name')} 搜索字幕异常：{e}"
-                    )
+                    logger.debug(f"【{self.plugin_name}】{site_name} 搜索字幕异常：{e}")
 
-            chinese_subs = [
-                s for s in all_subtitles if self._is_chinese_subtitle(s)
-            ]
+            chinese_subs = [s for s in all_subtitles if self._is_chinese_subtitle(s)]
 
             if not chinese_subs:
                 logger.info(
@@ -137,7 +221,7 @@ class SubtitleHunter(_PluginBase):
 
             logger.info(
                 f"【{self.plugin_name}】{mediainfo.title_year} 找到 {len(chinese_subs)} 条中文字幕，"
-                f"选择：{best.title}（来源：{best.site_name}）"
+                f"选择：{best.title}（来源：{best.site_name}，下载次数：{best.grabs}）"
             )
 
             self._download_subtitle(best, target_dir)
@@ -149,9 +233,6 @@ class SubtitleHunter(_PluginBase):
             )
 
     def _download_subtitle(self, subtitle: SubtitleInfo, target_dir: Path):
-        """
-        下载字幕到目标目录。
-        """
         if not subtitle.enclosure:
             logger.warning(f"【{self.plugin_name}】字幕无下载链接：{subtitle.title}")
             return
@@ -199,9 +280,7 @@ class SubtitleHunter(_PluginBase):
             )
 
             if success:
-                logger.info(
-                    f"【{self.plugin_name}】字幕下载成功：{subtitle.title} -> {files}"
-                )
+                logger.info(f"【{self.plugin_name}】字幕下载成功：{subtitle.title} -> {files}")
             else:
                 logger.warning(f"【{self.plugin_name}】字幕保存失败：{msg}")
 
@@ -209,9 +288,6 @@ class SubtitleHunter(_PluginBase):
             logger.error(f"【{self.plugin_name}】字幕下载异常：{e}")
 
     def _has_chinese_subtitle(self, target_dir: Path) -> bool:
-        """
-        检查目标目录是否已有中文字幕文件。
-        """
         if not target_dir.exists():
             return False
 
@@ -225,9 +301,6 @@ class SubtitleHunter(_PluginBase):
 
     @classmethod
     def _is_chinese_subtitle(cls, subtitle: SubtitleInfo) -> bool:
-        """
-        判断字幕是否为中文字幕。
-        """
         text = " ".join(filter(None, [
             subtitle.language or "",
             subtitle.title or "",
@@ -270,6 +343,40 @@ class SubtitleHunter(_PluginBase):
                                     }
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "onlyonce",
+                                            "label": "立即运行一次",
+                                            "hint": "保存后立即对指定目录搜索中文字幕",
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "target_path",
+                                            "label": "媒体目录路径",
+                                            "placeholder": "/18T01/Movies/Movie/痴迷 (2026)",
+                                            "hint": "运行一次时搜索该目录的中文字幕，填写媒体文件所在目录的完整路径",
+                                        },
+                                    }
+                                ],
+                            }
                         ],
                     },
                     {
@@ -284,7 +391,7 @@ class SubtitleHunter(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "资源入库后自动检查是否缺少中文字幕，若缺少则遍历所有已添加的PT站点搜索并下载最佳中文字幕。",
+                                            "text": "启用后资源入库自动搜索中文字幕。也可填写媒体目录后点击立即运行一次手动触发搜索。",
                                         },
                                     }
                                 ],
@@ -296,6 +403,8 @@ class SubtitleHunter(_PluginBase):
         ], {
             "enabled": False,
             "notify": True,
+            "onlyonce": False,
+            "target_path": "",
         }
 
     def get_page(self) -> List[dict]:
