@@ -1,4 +1,16 @@
 {
+  "SubtitleHunter": {
+    "name": "SubtitleHunter",
+    "description": "资源入库后自动遍历所有PT站点搜索并下载中文字幕",
+    "labels": "字幕,中文字幕",
+    "version": "1.0",
+    "icon": "subtitle.png",
+    "author": "milikii",
+    "level": 1,
+    "history": {
+      "v1.0": "初始版本：入库后自动全站搜索中文字幕并下载"
+    }
+  },
   "ProwlarrExtend": {
     "name": "ProwlarrExtend",
     "description": "扩展检索以支持Prowlarr站点资源",
