@@ -26,7 +26,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "2.2"
+    plugin_version = "2.3"
     # 插件作者
     plugin_author = "milikii"
     # 作者主页
@@ -63,32 +63,16 @@ class ProwlarrExtend(_PluginBase):
             self._onlyonce = config.get("onlyonce", False)
             self._cron = config.get("cron") or "0 0 */24 * *"
 
+        synced_once = False
         if self._onlyonce:
             logger.info(f"【{self.plugin_name}】立即获取索引器状态")
-            self.get_status()
+            self.sync_indexers()
+            synced_once = True
             self._onlyonce = False
             self.__update_config()
 
-        if not self._indexers:
-            self.get_status()
-
-        registered = 0
-        updated = 0
-        for indexer in self._indexers:
-            domain = indexer.get("domain", "")
-            site_info = self.sites_helper.get_indexer(domain)
-            if not site_info:
-                self.sites_helper.add_indexer(domain, copy.deepcopy(indexer))
-                registered += 1
-            elif site_info.get("id") != indexer.get("id") or site_info.get("url") != indexer.get("url"):
-                self.sites_helper.add_indexer(domain, copy.deepcopy(indexer))
-                updated += 1
-        site_ids = self.__sync_site_records()
-        self.__sync_search_sites(site_ids)
-        logger.info(
-            f"【{self.plugin_name}】索引器加载完成，共 {len(self._indexers)} 个，"
-            f"本次注册 {registered} 个、更新 {updated} 个虚拟站点"
-        )
+        if not synced_once and not self._indexers:
+            self.sync_indexers()
 
     def get_service(self) -> List[Dict[str, Any]]:
         if self._enabled and self._cron:
@@ -96,20 +80,37 @@ class ProwlarrExtend(_PluginBase):
                 "id": "ProwlarrExtendRefresh",
                 "name": "Prowlarr 索引刷新",
                 "trigger": CronTrigger.from_crontab(self._cron),
-                "func": self.get_status,
+                "func": self.sync_indexers,
                 "kwargs": {}
             }]
         return []
 
     def get_status(self):
+        return self.sync_indexers()
+
+    def sync_indexers(self):
         if not self._api_key or not self._host:
             logger.warning(
-                f"【{self.plugin_name}】get_status 提前返回："
+                f"【{self.plugin_name}】同步索引器提前返回："
                 f"host={'有' if self._host else '空'}, "
                 f"api_key={'有' if self._api_key else '空'}"
             )
             return False
-        self._indexers = self.get_indexers()
+        indexers = self.get_indexers()
+        if indexers is None:
+            logger.warning(f"【{self.plugin_name}】本次索引器同步失败，保留 MoviePilot 现有站点")
+            return False
+        self._indexers = indexers
+        if not self._enabled:
+            return True if isinstance(self._indexers, list) and len(self._indexers) > 0 else False
+
+        registered, updated = self.__sync_helper_indexers()
+        site_ids, removed_site_ids = self.__sync_site_records()
+        self.__sync_search_sites(site_ids, removed_site_ids)
+        logger.info(
+            f"【{self.plugin_name}】索引器同步完成，当前启用 {len(self._indexers)} 个，"
+            f"本次注册 {registered} 个、更新 {updated} 个虚拟站点"
+        )
         return True if isinstance(self._indexers, list) and len(self._indexers) > 0 else False
 
     def get_state(self) -> bool:
@@ -143,27 +144,85 @@ class ProwlarrExtend(_PluginBase):
             "async_search_torrents": self.async_search_torrents,
         }
 
-    def get_indexers(self):
-        headers = {
+    def __headers(self) -> Dict[str, str]:
+        return {
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "User-Agent": settings.USER_AGENT,
             "X-Api-Key": self._api_key,
             "Accept": "application/json, text/javascript, */*; q=0.01"
         }
-        indexer_query_url = f"{self._host}/api/v1/indexerstats"
+
+    def __request_json(self, api_url: str):
+        ret = RequestUtils(
+            headers=self.__headers(),
+            proxies=settings.PROXY if self._proxy else None
+        ).get_res(api_url)
+        if not ret:
+            return None
+        return ret.json()
+
+    def get_indexers(self):
+        indexers = self.__get_indexers_from_config()
+        if indexers is not None:
+            return indexers
+        return self.__get_indexers_from_stats()
+
+    def __get_indexers_from_config(self):
+        indexer_query_url = f"{self._host}/api/v1/indexer"
         try:
-            ret = RequestUtils(
-                headers=headers,
-                proxies=settings.PROXY if self._proxy else None
-            ).get_res(indexer_query_url)
-            if not ret:
-                logger.warning(f"【{self.plugin_name}】获取 indexer 请求无响应")
+            data = self.__request_json(indexer_query_url)
+            if data is None:
+                logger.warning(f"【{self.plugin_name}】获取 indexer 配置请求无响应")
+                return None
+            if not isinstance(data, list):
+                logger.warning(f"【{self.plugin_name}】indexer 配置返回数据格式异常")
+                return None
+            if not data:
+                logger.info(f"【{self.plugin_name}】Prowlarr 未配置任何 indexer")
                 return []
 
-            data = ret.json()
+            indexers = []
+            disabled = 0
+            unsupported = 0
+            for item in data:
+                indexer_id = item.get("id")
+                indexer_name = item.get("name") or item.get("definitionName")
+                if not indexer_id or not indexer_name:
+                    continue
+                if item.get("enable") is False:
+                    disabled += 1
+                    continue
+                if item.get("supportsSearch") is False:
+                    unsupported += 1
+                    continue
+
+                protocol = item.get("protocol")
+                if isinstance(protocol, str) and protocol.lower() != "torrent":
+                    unsupported += 1
+                    continue
+
+                indexers.append(self.__build_indexer(indexer_id, indexer_name))
+
+            logger.info(
+                f"【{self.plugin_name}】从 Prowlarr 获取到 {len(indexers)} 个启用索引器，"
+                f"跳过禁用 {disabled} 个、不支持搜索/非 Torrent {unsupported} 个"
+            )
+            return indexers
+        except Exception as e:
+            logger.warning(f"【{self.plugin_name}】获取 indexer 配置失败，将回退到 indexerstats：{str(e)}")
+            return None
+
+    def __get_indexers_from_stats(self):
+        indexer_query_url = f"{self._host}/api/v1/indexerstats"
+        try:
+            data = self.__request_json(indexer_query_url)
+            if data is None:
+                logger.warning(f"【{self.plugin_name}】获取 indexer 请求无响应")
+                return None
+
             if not data or "indexers" not in data:
                 logger.warning(f"【{self.plugin_name}】返回数据不包含 indexers 字段")
-                return []
+                return None
 
             indexers_raw = data.get("indexers", [])
             if not indexers_raw:
@@ -177,20 +236,23 @@ class ProwlarrExtend(_PluginBase):
                 if not indexer_id or not indexer_name:
                     continue
 
-                indexers.append({
-                    "id": f'{self.plugin_name}-{indexer_id}',
-                    "name": f'{self.plugin_name}-{indexer_name}',
-                    "url": f'{self._host}/api/v1/indexer/{indexer_id}',
-                    "domain": self.__build_domain(indexer_id),
-                    "public": True,
-                    "proxy": self._proxy,
-                })
+                indexers.append(self.__build_indexer(indexer_id, indexer_name))
 
-            logger.info(f"【{self.plugin_name}】从 Prowlarr 获取到 {len(indexers)} 个索引器")
+            logger.info(f"【{self.plugin_name}】从 Prowlarr indexerstats 获取到 {len(indexers)} 个索引器")
             return indexers
         except Exception as e:
             logger.error(f"【{self.plugin_name}】获取 indexer 失败：{str(e)}")
-            return []
+            return None
+
+    def __build_indexer(self, indexer_id, indexer_name) -> Dict[str, Any]:
+        return {
+            "id": f'{self.plugin_name}-{indexer_id}',
+            "name": f'{self.plugin_name}-{indexer_name}',
+            "url": f'{self._host}/api/v1/indexer/{indexer_id}',
+            "domain": self.__build_domain(indexer_id),
+            "public": True,
+            "proxy": self._proxy,
+        }
 
     def search_torrents(self, site: dict, keyword: str, mtype: Optional[MediaType] = None, page: Optional[int] = 0) -> \
             List[TorrentInfo]:
@@ -333,12 +395,51 @@ class ProwlarrExtend(_PluginBase):
     def __legacy_domain(self, indexer_id) -> str:
         return f"{indexer_id}.prowlarr.extend"
 
-    def __sync_site_records(self) -> List[int]:
-        if not self._enabled or not self._indexers:
+    def __is_managed_domain(self, domain: str) -> bool:
+        if not domain:
+            return False
+        raw_domain = domain
+        if "://" in raw_domain:
+            raw_domain = urlparse(raw_domain).hostname or raw_domain
+        raw_domain = raw_domain.strip("/")
+
+        if raw_domain.startswith("prowlarr-") and raw_domain.endswith(f".{self.prowlarr_domain_suffix}"):
+            indexer_id = raw_domain.split(".", 1)[0].replace("prowlarr-", "", 1)
+            return indexer_id.isdigit()
+
+        parts = raw_domain.split(".")
+        return len(parts) == 3 and parts[0].isdigit() and parts[1:] == ["prowlarr", "extend"]
+
+    def __get_managed_site_records(self) -> List[Site]:
+        try:
+            sites = Site.list_order_by_pri(None) or []
+        except Exception as e:
+            logger.warning(f"【{self.plugin_name}】读取 MoviePilot 站点列表失败，跳过旧站点清理：{str(e)}")
             return []
+        return [site for site in sites if self.__is_managed_domain(getattr(site, "domain", ""))]
+
+    def __sync_helper_indexers(self) -> Tuple[int, int]:
+        registered = 0
+        updated = 0
+        for indexer in self._indexers:
+            domain = indexer.get("domain", "")
+            site_info = self.sites_helper.get_indexer(domain)
+            if not site_info:
+                self.sites_helper.add_indexer(domain, copy.deepcopy(indexer))
+                registered += 1
+            elif site_info.get("id") != indexer.get("id") or site_info.get("url") != indexer.get("url"):
+                self.sites_helper.add_indexer(domain, copy.deepcopy(indexer))
+                updated += 1
+        return registered, updated
+
+    def __sync_site_records(self) -> Tuple[List[int], List[int]]:
+        if not self._enabled:
+            return [], []
 
         current_domains = {indexer.get("domain") for indexer in self._indexers if indexer.get("domain")}
         site_ids = []
+        removed_site_ids = []
+        removed_site_keys = set()
         created = 0
         updated = 0
         removed = 0
@@ -381,8 +482,20 @@ class ProwlarrExtend(_PluginBase):
 
             indexer_id = self.__get_indexer_id(indexer)
             legacy_site = Site.get_by_domain(None, self.__legacy_domain(indexer_id)) if indexer_id else None
-            if legacy_site and legacy_site.domain not in current_domains:
+            legacy_site_id = getattr(legacy_site, "id", None)
+            if legacy_site and legacy_site_id and legacy_site.domain not in current_domains:
                 Site.delete(None, legacy_site.id)
+                removed_site_ids.append(legacy_site_id)
+                removed_site_keys.add(str(legacy_site_id))
+                removed += 1
+
+        for site in self.__get_managed_site_records():
+            domain = getattr(site, "domain", "")
+            site_id = getattr(site, "id", None)
+            if site_id and str(site_id) not in removed_site_keys and domain not in current_domains:
+                Site.delete(None, site_id)
+                removed_site_ids.append(site_id)
+                removed_site_keys.add(str(site_id))
                 removed += 1
 
         if created or updated or removed:
@@ -391,35 +504,38 @@ class ProwlarrExtend(_PluginBase):
                 f"【{self.plugin_name}】同步正式站点：新增 {created} 个、更新 {updated} 个、清理旧站点 {removed} 个"
             )
 
-        return site_ids
+        return site_ids, removed_site_ids
 
-    def __sync_search_sites(self, site_ids: List[int]):
-        if not self._enabled or not self._indexers:
+    def __sync_search_sites(self, site_ids: List[int], removed_site_ids: Optional[List[int]] = None):
+        if not self._enabled:
             return
 
         selected_sites = self.systemconfig.get(SystemConfigKey.IndexerSites) or []
         if not selected_sites:
             return
 
-        if not site_ids:
-            return
+        removed_site_ids = removed_site_ids or []
+        managed_site_keys = {str(site_id) for site_id in site_ids + removed_site_ids if site_id is not None}
 
         cleaned_sites = [
             site_id
             for site_id in selected_sites
             if not (isinstance(site_id, str) and site_id.startswith(f"{self.plugin_name}-"))
-            and site_id not in site_ids
+            and str(site_id) not in managed_site_keys
         ]
         missing_ids = [
             site_id
             for site_id in site_ids
-            if site_id not in cleaned_sites
+            if str(site_id) not in {str(cleaned_site) for cleaned_site in cleaned_sites}
         ]
         if not missing_ids and cleaned_sites == selected_sites:
             return
 
         self.systemconfig.set(SystemConfigKey.IndexerSites, cleaned_sites + missing_ids)
-        logger.info(f"【{self.plugin_name}】已同步 {len(site_ids)} 个正式站点到搜索站点范围")
+        logger.info(
+            f"【{self.plugin_name}】已同步 {len(site_ids)} 个正式站点到搜索站点范围，"
+            f"清理 {len(removed_site_ids)} 个旧站点"
+        )
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [
