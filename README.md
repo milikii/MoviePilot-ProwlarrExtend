@@ -141,7 +141,7 @@ ProwlarrExtend 仍为 v2.3。完整历史见 [`package.v2.json`](./package.v2.js
 
 ## 来源
 
-Fork 自 [jtcymc/MoviePilot-PluginsV2](https://github.com/jtcymc/MoviePilot-PluginsV2)（上游已停止维护）。本仓库在原 ProwlarrExtend 的基础上继续维护，并新增了 SubtitleHunter；ProwlarrExtend 的定时任务、站点同步、启用状态同步、搜索字段映射等核心逻辑都重写过。
+基于 [jtcymc/MoviePilot-PluginsV2](https://github.com/jtcymc/MoviePilot-PluginsV2) 改造（未走 GitHub fork，手动 clone 后重写维护；上游已停止维护）。本仓库在原 ProwlarrExtend 的基础上继续维护并新增了 SubtitleHunter；ProwlarrExtend 的定时任务、站点同步、启用状态同步、搜索字段映射等核心逻辑均已重写。
 
 ## 开发文档
 
