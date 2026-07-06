@@ -68,7 +68,7 @@ class SubtitleHunter(_PluginBase):
     plugin_name = "SubtitleHunter"
     plugin_desc = "入库后自动检测、提取、翻译并规范化字幕"
     plugin_icon = "subtitle.png"
-    plugin_version = "2.5"
+    plugin_version = "2.6"
     plugin_author = "milikii"
     author_url = "https://github.com/milikii"
     plugin_config_prefix = "subtitle_hunter_"
@@ -212,13 +212,13 @@ class SubtitleHunter(_PluginBase):
         if runtime.get("running"):
             message = "上一次任务仍在运行，已跳过本次"
             logger.warning(f"【{self.plugin_name}】定时任务跳过：{message}")
-            self._send_notify("定时任务跳过", message)
+            self._send_notify("定时任务跳过", self._build_skip_notify_text(message))
             return
 
         if not self._target_path:
             message = "未配置媒体目录或视频路径"
             logger.warning(f"【{self.plugin_name}】定时任务跳过：{message}")
-            self._send_notify("定时任务跳过", f"定时任务跳过：{message}")
+            self._send_notify("定时任务跳过", self._build_skip_notify_text(message))
             return
 
         self._start_background_job(
@@ -393,13 +393,14 @@ class SubtitleHunter(_PluginBase):
                 len(videos),
                 self._estimate_scan_subtitle_chars(scan["subtitles"]),
             )
-            notify_text = (
-                f"来源：{source}\n"
-                f"媒体：{display_name}\n"
-                f"发现 {len(videos)} 个视频\n"
-                f"预计耗时：{self._format_duration(eta_seconds)}\n"
-                f"翻译档位：{self._translation_profile}，并发 {self._parallel_batches}\n"
-                f"{self._now_text()} 开始"
+            notify_text = self._build_start_notify_text(
+                source=source,
+                display_name=display_name,
+                target=target,
+                video_count=len(videos),
+                subtitle_count=len(scan["subtitles"]),
+                eta_seconds=eta_seconds,
+                scan_errors=scan["errors"],
             )
             self._send_notify("开始处理字幕", notify_text)
 
@@ -440,14 +441,27 @@ class SubtitleHunter(_PluginBase):
                 f"提取 {summary['extracted']}，翻译 {summary['translated']}，"
                 f"重命名 {summary['renamed']}，失败 {summary['failed']}"
             )
+            duration_seconds = max(time.monotonic() - started_at, 0)
+            notify_text = self._build_finish_notify_text(
+                final_status=final_status,
+                source=source,
+                display_name=display_name,
+                target=target,
+                summary=summary,
+                details=details,
+                duration_seconds=duration_seconds,
+            )
             self._finish_run(final_status, message, started_at, details=details, **summary)
-            self._send_notify(final_status, message)
+            self._send_notify(final_status, notify_text)
 
         except Exception as e:
             message = f"{display_name} 字幕处理失败：{e}"
             logger.error(f"【{self.plugin_name}】{message}\n{traceback.format_exc()}")
             self._finish_run("失败", message, started_at, error=traceback.format_exc())
-            self._send_notify("字幕处理失败", message)
+            self._send_notify(
+                "字幕处理失败",
+                self._build_failure_notify_text(source, display_name, target, e),
+            )
 
     def _ensure_video_chinese(self, video_path: Path, media_context: str) -> Dict[str, Any]:
         detail = {
@@ -1911,6 +1925,147 @@ class SubtitleHunter(_PluginBase):
     @staticmethod
     def _now_text() -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _build_skip_notify_text(self, reason: str, source: str = "定时任务") -> str:
+        """Build a readable notification for skipped scheduled runs."""
+        lines = [
+            f"来源：{source}",
+            "状态：已跳过",
+            f"原因：{self._truncate_notify_text(reason, 160)}",
+        ]
+        if self._target_path:
+            lines.append(f"目标：{self._compact_notify_path(self._target_path)}")
+        lines.append(f"时间：{self._now_text()}")
+        return "\n".join(lines)
+
+    def _build_start_notify_text(
+        self,
+        source: str,
+        display_name: str,
+        target: Path,
+        video_count: int,
+        subtitle_count: int,
+        eta_seconds: int,
+        scan_errors: List[str],
+    ) -> str:
+        """Build a readable notification for workflow start."""
+        lines = [
+            f"媒体：{display_name}",
+            f"来源：{source}",
+            f"目标：{self._compact_notify_path(target)}",
+            f"范围：{video_count} 个视频，{subtitle_count} 条字幕轨",
+            f"预计耗时：{self._format_duration(eta_seconds)}",
+            f"翻译配置：{self._translation_profile_label()}，并发 {self._parallel_batches}，批次 {self._batch_chars} 字",
+            f"开始时间：{self._now_text()}",
+        ]
+        if scan_errors:
+            lines.append(f"扫描提醒：{len(scan_errors)} 条")
+            for error in scan_errors[:2]:
+                lines.append(f"- {self._truncate_notify_text(error, 120)}")
+        return "\n".join(lines)
+
+    def _build_finish_notify_text(
+        self,
+        final_status: str,
+        source: str,
+        display_name: str,
+        target: Path,
+        summary: Dict[str, int],
+        details: List[Dict[str, Any]],
+        duration_seconds: float,
+    ) -> str:
+        """Build a readable notification for workflow completion."""
+        lines = [
+            f"媒体：{display_name}",
+            f"来源：{source}",
+            f"状态：{final_status}",
+            f"耗时：{self._format_duration(max(1, ceil(duration_seconds)))}",
+            f"目标：{self._compact_notify_path(target)}",
+            (
+                "结果："
+                f"处理 {summary.get('processed', 0)}，"
+                f"生成 {summary.get('translated', 0)}，"
+                f"提取 {summary.get('extracted', 0)}，"
+                f"重命名 {summary.get('renamed', 0)}，"
+                f"跳过 {summary.get('skipped', 0)}，"
+                f"失败 {summary.get('failed', 0)}"
+            ),
+        ]
+
+        translated_files = self._collect_notify_files(details, "translated_files")
+        if translated_files:
+            lines.append("生成字幕：")
+            lines.extend(f"- {self._compact_notify_path(path)}" for path in translated_files[:3])
+
+        extracted_files = self._collect_notify_files(details, "extracted_files")
+        if extracted_files:
+            lines.append("提取字幕：")
+            lines.extend(f"- {self._compact_notify_path(path)}" for path in extracted_files[:2])
+
+        failed_details = [detail for detail in details if detail.get("status") == "失败"]
+        if failed_details:
+            lines.append("失败原因：")
+            for detail in failed_details[:3]:
+                video_name = Path(str(detail.get("video") or "未知视频")).name
+                reason = self._truncate_notify_text(detail.get("message") or "未知错误", 160)
+                lines.append(f"- {video_name}：{reason}")
+        elif not translated_files and not extracted_files:
+            lines.append("说明：未生成新字幕，通常是已有中文字幕或 AI 翻译不可用。")
+
+        lines.append(f"完成时间：{self._now_text()}")
+        return "\n".join(lines)
+
+    def _build_failure_notify_text(
+        self,
+        source: str,
+        display_name: str,
+        target: Path,
+        error: Exception,
+    ) -> str:
+        """Build a readable notification for unexpected workflow exceptions."""
+        return "\n".join([
+            f"媒体：{display_name}",
+            f"来源：{source}",
+            "状态：失败",
+            f"目标：{self._compact_notify_path(target)}",
+            f"错误：{self._truncate_notify_text(error, 220)}",
+            f"时间：{self._now_text()}",
+        ])
+
+    def _collect_notify_files(self, details: List[Dict[str, Any]], field: str) -> List[str]:
+        """Collect file paths from detail records for compact notifications."""
+        files = []
+        for detail in details:
+            for item in detail.get(field, []) or []:
+                files.append(str(item))
+        return files
+
+    def _translation_profile_label(self) -> str:
+        """Return a Chinese label for the current translation profile."""
+        labels = {
+            "fast": "快速",
+            "standard": "标准",
+            "quality": "质量优先",
+        }
+        label = labels.get(self._translation_profile, self._translation_profile)
+        return f"{label}({self._translation_profile})"
+
+    def _compact_notify_path(self, path: Any, max_parts: int = 3) -> str:
+        """Shorten long paths while keeping the most useful trailing parts."""
+        text = str(path or "")
+        if not text:
+            return "-"
+        parts = Path(text).parts
+        if len(parts) <= max_parts:
+            return text
+        return ".../" + "/".join(parts[-max_parts:])
+
+    def _truncate_notify_text(self, value: Any, limit: int) -> str:
+        """Collapse whitespace and trim long notification fragments."""
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if len(text) <= limit:
+            return text
+        return f"{text[:max(limit - 3, 0)]}..."
 
     def _estimate_scan_subtitle_chars(self, tracks: List[SubtitleTrack]) -> int:
         """Estimate subtitle text size from scanned text-based external subtitle files."""
