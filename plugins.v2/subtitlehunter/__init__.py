@@ -68,7 +68,7 @@ class SubtitleHunter(_PluginBase):
     plugin_name = "SubtitleHunter"
     plugin_desc = "入库后自动检测、提取、翻译并规范化字幕"
     plugin_icon = "subtitle.png"
-    plugin_version = "2.8"
+    plugin_version = "2.9"
     plugin_author = "milikii"
     author_url = "https://github.com/milikii"
     plugin_config_prefix = "subtitle_hunter_"
@@ -999,6 +999,7 @@ class SubtitleHunter(_PluginBase):
         prompt = self._translation_prompt(stage, media_context, glossary_text)
         requested_indexes = {int(item["index"]) for item in items}
         attempts = self._api_retries + 1
+        last_error = None
 
         for attempt in range(attempts):
             try:
@@ -1020,6 +1021,7 @@ class SubtitleHunter(_PluginBase):
             except MemoryError:
                 raise
             except Exception as e:
+                last_error = e
                 if attempt >= attempts - 1:
                     break
                 delay = max(1, self._api_timeout // 60) * (attempt + 1)
@@ -1028,6 +1030,9 @@ class SubtitleHunter(_PluginBase):
                     f"{delay}s 后重试 {attempt + 1}/{self._api_retries}：{e}"
                 )
                 time.sleep(delay)
+
+        if stage == "compress":
+            raise RuntimeError(f"{stage_name}失败，已重试 {self._api_retries} 次：{last_error}")
 
         attempt = self._api_retries + 1
         logger.warning(f"【{self.plugin_name}】{stage_name}进入慢重试，将一直重试到成功")
