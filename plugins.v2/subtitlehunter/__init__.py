@@ -9,9 +9,11 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
+from math import ceil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from apscheduler.triggers.cron import CronTrigger
 import requests
 from app.core.config import settings
 from app.core.context import MediaInfo
@@ -66,7 +68,7 @@ class SubtitleHunter(_PluginBase):
     plugin_name = "SubtitleHunter"
     plugin_desc = "入库后自动检测、提取、翻译并规范化字幕"
     plugin_icon = "subtitle.png"
-    plugin_version = "2.4"
+    plugin_version = "2.5"
     plugin_author = "milikii"
     author_url = "https://github.com/milikii"
     plugin_config_prefix = "subtitle_hunter_"
@@ -110,6 +112,7 @@ class SubtitleHunter(_PluginBase):
         self._notify = True
         self._onlyonce = False
         self._target_path = ""
+        self._schedule_cron = ""
         self._auto_ensure = True
         self._rename_existing = True
         self._extract_chinese_embedded = True
@@ -139,6 +142,7 @@ class SubtitleHunter(_PluginBase):
             self._notify = bool(config.get("notify", True))
             self._onlyonce = bool(config.get("onlyonce", False))
             self._target_path = config.get("target_path", "") or ""
+            self._schedule_cron = config.get("schedule_cron", "") or ""
             self._auto_ensure = bool(config.get("auto_ensure", True))
             self._rename_existing = bool(config.get("rename_existing", True))
             self._extract_chinese_embedded = bool(config.get("extract_chinese_embedded", True))
@@ -187,10 +191,41 @@ class SubtitleHunter(_PluginBase):
         return self._enabled
 
     def get_service(self) -> List[Dict[str, Any]]:
+        if self._enabled and self._schedule_cron:
+            return [{
+                "id": "SubtitleHunterSchedule",
+                "name": "SubtitleHunter 定时处理",
+                "trigger": CronTrigger.from_crontab(self._schedule_cron),
+                "func": self._scheduled_run,
+                "kwargs": {},
+            }]
         return []
 
     def stop_service(self):
         pass
+
+    def _scheduled_run(self):
+        """Run the configured scheduled subtitle workflow when no job is active."""
+        self._ensure_runtime_status()
+        with self._status_lock:
+            runtime = dict(self._runtime)
+        if runtime.get("running"):
+            message = "上一次任务仍在运行，已跳过本次"
+            logger.warning(f"【{self.plugin_name}】定时任务跳过：{message}")
+            self._send_notify("定时任务跳过", message)
+            return
+
+        if not self._target_path:
+            message = "未配置媒体目录或视频路径"
+            logger.warning(f"【{self.plugin_name}】定时任务跳过：{message}")
+            self._send_notify("定时任务跳过", f"定时任务跳过：{message}")
+            return
+
+        self._start_background_job(
+            source="定时任务",
+            target_path=self._target_path,
+            mediainfo=None,
+        )
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
@@ -354,6 +389,19 @@ class SubtitleHunter(_PluginBase):
                 message=f"发现 {len(videos)} 个视频，开始处理字幕",
                 errors=scan["errors"],
             )
+            eta_seconds = self._estimate_eta_seconds(
+                len(videos),
+                self._estimate_scan_subtitle_chars(scan["subtitles"]),
+            )
+            notify_text = (
+                f"来源：{source}\n"
+                f"媒体：{display_name}\n"
+                f"发现 {len(videos)} 个视频\n"
+                f"预计耗时：{self._format_duration(eta_seconds)}\n"
+                f"翻译档位：{self._translation_profile}，并发 {self._parallel_batches}\n"
+                f"{self._now_text()} 开始"
+            )
+            self._send_notify("开始处理字幕", notify_text)
 
             summary = {
                 "processed": 0,
@@ -1864,12 +1912,58 @@ class SubtitleHunter(_PluginBase):
     def _now_text() -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    def _estimate_scan_subtitle_chars(self, tracks: List[SubtitleTrack]) -> int:
+        """Estimate subtitle text size from scanned text-based external subtitle files."""
+        total = 0
+        for track in tracks:
+            if not track.text_based or not track.path:
+                continue
+            try:
+                if track.path.exists():
+                    total += track.path.stat().st_size
+            except OSError:
+                continue
+        return total
+
+    def _estimate_eta_seconds(self, video_count, total_chars) -> int:
+        """Estimate scheduled workflow duration from subtitle size, profile and concurrency."""
+        if video_count <= 0:
+            return 0
+        profile_multiplier = {
+            "fast": 1,
+            "standard": 2,
+            "quality": 3,
+        }.get(self._translation_profile, 3)
+        extra_stages = 1.0
+        batches = ceil(max(total_chars, 0) / max(self._batch_chars, 1))
+        batches = max(batches, 1)
+        workers = max(self._parallel_batches, 1)
+        return int(ceil(batches * (profile_multiplier + extra_stages) * 12 / workers) * video_count)
+
+    def _format_duration(self, seconds: int) -> str:
+        """Format rough ETA seconds as a short Chinese duration string."""
+        if seconds <= 0:
+            return "未知"
+        if seconds < 60:
+            return f"约 {seconds} 秒"
+        if seconds < 3600:
+            return f"约 {ceil(seconds / 60)} 分钟"
+        hours = seconds // 3600
+        minutes = ceil((seconds % 3600) / 60)
+        if minutes == 60:
+            hours += 1
+            minutes = 0
+        if minutes <= 0:
+            return f"约 {hours} 小时"
+        return f"约 {hours} 小时 {minutes} 分钟"
+
     def _current_config(self, onlyonce: Optional[bool] = None) -> Dict[str, Any]:
         return {
             "enabled": self._enabled,
             "notify": self._notify,
             "onlyonce": self._onlyonce if onlyonce is None else onlyonce,
             "target_path": self._target_path,
+            "schedule_cron": self._schedule_cron,
             "auto_ensure": self._auto_ensure,
             "rename_existing": self._rename_existing,
             "extract_chinese_embedded": self._extract_chinese_embedded,
@@ -1933,6 +2027,19 @@ class SubtitleHunter(_PluginBase):
                                 "content": [{
                                     "component": "VSwitch",
                                     "props": {"model": "onlyonce", "label": "立即运行一次"},
+                                }],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [{
+                                    "component": "VTextField",
+                                    "props": {
+                                        "model": "schedule_cron",
+                                        "label": "定时执行周期",
+                                        "placeholder": "0 3 * * *",
+                                        "hint": "5 位 cron；留空禁用定时；如 0 3 * * * 表示每天凌晨 3 点对 target_path 执行。当 ai_enabled 关闭时也能跑（仅提取/命名）。",
+                                    },
                                 }],
                             },
                         ],
