@@ -2093,7 +2093,8 @@ class SubtitleHunter(_PluginBase):
         batches = ceil(max(total_chars, 0) / max(self._batch_chars, 1))
         batches = max(batches, 1)
         workers = max(self._parallel_batches, 1)
-        return int(ceil(batches * (profile_multiplier + extra_stages) * 12 / workers) * video_count)
+        # 每段翻译批次按 45 秒估算（OpenAI 兼容网关生成长 JSON 平均 30-90 秒/批，含重试余量）
+        return int(ceil(batches * (profile_multiplier + extra_stages) * 45 / workers) * video_count)
 
     def _format_duration(self, seconds: int) -> str:
         """Format rough ETA seconds as a short Chinese duration string."""
