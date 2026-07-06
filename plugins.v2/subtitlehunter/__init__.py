@@ -66,7 +66,7 @@ class SubtitleHunter(_PluginBase):
     plugin_name = "SubtitleHunter"
     plugin_desc = "入库后自动检测、提取、翻译并规范化字幕"
     plugin_icon = "subtitle.png"
-    plugin_version = "2.3"
+    plugin_version = "2.4"
     plugin_author = "milikii"
     author_url = "https://github.com/milikii"
     plugin_config_prefix = "subtitle_hunter_"
@@ -131,6 +131,7 @@ class SubtitleHunter(_PluginBase):
         self._target_language = "zh-Hans"
         self._translation_suffix = "ai"
         self._glossary = ""
+        self._enable_line_check = True
         self._ffmpeg_timeout = 600
 
         if config:
@@ -163,6 +164,7 @@ class SubtitleHunter(_PluginBase):
             self._target_language = config.get("target_language", self._target_language) or self._target_language
             self._translation_suffix = config.get("translation_suffix", self._translation_suffix) or self._translation_suffix
             self._glossary = config.get("glossary", "") or ""
+            self._enable_line_check = bool(config.get("enable_line_check", True))
             self._ffmpeg_timeout = self._safe_int(config.get("ffmpeg_timeout"), 600, 60, 7200)
 
         self._init_runtime_status()
@@ -721,6 +723,8 @@ class SubtitleHunter(_PluginBase):
         if not batches:
             return cues
 
+        ai_glossary = self._generate_ai_glossary(batches, media_context, ai_config) if self._ai_enabled else {}
+        glossary_text = self._build_effective_glossary(ai_glossary)
         workers = min(max(self._parallel_batches, 1), len(batches))
         logger.info(
             f"【{self.plugin_name}】开始翻译：{len(translatable)} 条字幕，"
@@ -737,6 +741,7 @@ class SubtitleHunter(_PluginBase):
                     batch,
                     media_context,
                     ai_config,
+                    glossary_text,
                 ): (batch_no, batch)
                 for batch_no, batch in enumerate(batches, start=1)
             }
@@ -775,7 +780,7 @@ class SubtitleHunter(_PluginBase):
                 ))
             else:
                 output.append(cue)
-        return output
+        return self._validate_line_length(output, media_context, ai_config, glossary_text)
 
     def _translate_batch(
         self,
@@ -784,6 +789,7 @@ class SubtitleHunter(_PluginBase):
         batch: List[SubtitleCue],
         media_context: str,
         ai_config: Dict[str, Any],
+        glossary_text: str,
     ) -> Dict[int, str]:
         logger.info(
             f"【{self.plugin_name}】翻译批次 {batch_no}/{total_batches}："
@@ -801,6 +807,7 @@ class SubtitleHunter(_PluginBase):
                 media_context=media_context,
                 previous=None,
                 ai_config=ai_config,
+                glossary_text=glossary_text,
             )
 
         literal = self._translate_stage(
@@ -809,6 +816,7 @@ class SubtitleHunter(_PluginBase):
             media_context=media_context,
             previous=None,
             ai_config=ai_config,
+            glossary_text=glossary_text,
         )
 
         if self._translation_profile == "standard":
@@ -818,6 +826,7 @@ class SubtitleHunter(_PluginBase):
                 media_context=media_context,
                 previous=literal,
                 ai_config=ai_config,
+                glossary_text=glossary_text,
             )
             return {
                 cue.index: polished.get(cue.index) or literal.get(cue.index) or cue.text
@@ -830,6 +839,7 @@ class SubtitleHunter(_PluginBase):
             media_context=media_context,
             previous=literal,
             ai_config=ai_config,
+            glossary_text=glossary_text,
         )
         final = self._translate_stage(
             stage="polish",
@@ -837,6 +847,7 @@ class SubtitleHunter(_PluginBase):
             media_context=media_context,
             previous=reflected,
             ai_config=ai_config,
+            glossary_text=glossary_text,
         )
         return {
             cue.index: final.get(cue.index) or reflected.get(cue.index) or literal.get(cue.index) or cue.text
@@ -850,15 +861,18 @@ class SubtitleHunter(_PluginBase):
         media_context: str,
         previous: Optional[Dict[int, str]],
         ai_config: Dict[str, Any],
+        glossary_text: Optional[str] = None,
     ) -> Dict[int, str]:
         stage_name = {
             "direct": "快速翻译",
             "literal": "第一遍直译",
             "reflect": "第二遍反思修正",
             "polish": "第三遍意译润色",
+            "glossary_gen": "术语抽取",
+            "compress": "字幕压缩",
         }.get(stage, stage)
 
-        cache_key = self._translation_cache_key(stage, items, media_context, previous, ai_config)
+        cache_key = self._translation_cache_key(stage, items, media_context, previous, ai_config, glossary_text)
         cached = self._load_translation_cache(cache_key)
         if cached:
             logger.info(f"【{self.plugin_name}】{stage_name}命中缓存：{len(cached)} 条")
@@ -871,7 +885,7 @@ class SubtitleHunter(_PluginBase):
                 for index, text in sorted((previous or {}).items())
             ],
         }
-        prompt = self._translation_prompt(stage, media_context)
+        prompt = self._translation_prompt(stage, media_context, glossary_text)
         requested_indexes = {int(item["index"]) for item in items}
         last_error = None
         attempts = self._api_retries + 1
@@ -886,8 +900,10 @@ class SubtitleHunter(_PluginBase):
                 if not parsed:
                     raise RuntimeError(f"{stage_name}返回为空：{content[:200]}")
                 missing = requested_indexes - set(parsed.keys())
-                if missing:
+                if missing and stage != "compress":
                     raise RuntimeError(f"{stage_name}返回缺少字幕索引：{sorted(missing)[:10]}")
+                if missing:
+                    logger.warning(f"【{self.plugin_name}】{stage_name}返回缺少字幕索引，缺失条目保留原文：{sorted(missing)[:10]}")
                 self._save_translation_cache(cache_key, parsed, ai_config)
                 logger.info(f"【{self.plugin_name}】{stage_name}完成：{len(parsed)} 条")
                 return parsed
@@ -911,6 +927,7 @@ class SubtitleHunter(_PluginBase):
         media_context: str,
         previous: Optional[Dict[int, str]],
         ai_config: Dict[str, Any],
+        glossary_text: Optional[str] = None,
     ) -> str:
         payload = {
             "version": 5,
@@ -920,7 +937,7 @@ class SubtitleHunter(_PluginBase):
             "model": ai_config.get("model"),
             "target_language": self._target_language,
             "translation_profile": self._translation_profile,
-            "glossary": self._glossary,
+            "glossary": self._glossary if glossary_text is None else glossary_text,
             "media_context": media_context,
             "items": items,
             "previous": [
@@ -974,8 +991,12 @@ class SubtitleHunter(_PluginBase):
         except Exception as e:
             logger.warning(f"【{self.plugin_name}】写入翻译缓存失败：{path}，{e}")
 
-    def _translation_prompt(self, stage: str, media_context: str) -> str:
-        glossary = self._glossary.strip() or "无"
+    def _translation_prompt(self, stage: str, media_context: str, glossary_text: Optional[str] = None) -> str:
+        glossary = (self._glossary if glossary_text is None else glossary_text).strip() or "无"
+        if stage == "glossary_gen":
+            return self._glossary_prompt(media_context, glossary)
+        if stage == "compress":
+            return self._compress_prompt(media_context, glossary)
         base = (
             "你是专业影视字幕译者。你必须只返回 JSON 数组，不要 Markdown，不要解释。"
             "数组元素格式为 {\"index\": 数字, \"text\": \"译文\"}。"
@@ -1037,15 +1058,7 @@ class SubtitleHunter(_PluginBase):
             raise RuntimeError(f"AI API 返回格式不兼容：{payload}") from e
 
     def _parse_translation_response(self, content: str) -> Dict[int, str]:
-        text = (content or "").strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
-            text = re.sub(r"```$", "", text).strip()
-        start = text.find("[")
-        end = text.rfind("]")
-        if start >= 0 and end > start:
-            text = text[start:end + 1]
-        data = json.loads(text)
+        data = json.loads(self._extract_json_array(content))
         result = {}
         for item in data:
             index = int(item.get("index"))
@@ -1055,19 +1068,409 @@ class SubtitleHunter(_PluginBase):
 
     def _chunk_cues(self, cues: List[SubtitleCue]) -> List[List[SubtitleCue]]:
         chunks = []
-        current = []
-        current_chars = 0
-        for cue in cues:
-            text_len = len(cue.text)
-            if current and (len(current) >= self._batch_size or current_chars + text_len > self._batch_chars):
-                chunks.append(current)
-                current = []
-                current_chars = 0
-            current.append(cue)
-            current_chars += text_len
-        if current:
-            chunks.append(current)
+        lookahead = 5
+        total = len(cues)
+        start = 0
+        while start < total:
+            end = start
+            chars = 0
+            soft_count = max(1, int(self._batch_size * 0.9))
+            soft_chars = max(1, int(self._batch_chars * 0.9))
+            while end < total:
+                text_len = len(cues[end].text)
+                if end > start and (end - start >= self._batch_size or chars + text_len > self._batch_chars):
+                    break
+                chars += text_len
+                end += 1
+                if end >= total or end - start >= soft_count or chars >= soft_chars:
+                    break
+
+            if end >= total:
+                chunks.append(cues[start:end])
+                break
+
+            cut = end if self._is_sentence_boundary(cues[end - 1].text) else 0
+            probe_end = end
+            probe_chars = chars
+            while not cut and probe_end < total and probe_end - end < lookahead:
+                text_len = len(cues[probe_end].text)
+                if probe_end - start >= self._batch_size or probe_chars + text_len > self._batch_chars:
+                    break
+                probe_chars += text_len
+                probe_end += 1
+                if self._is_sentence_boundary(cues[probe_end - 1].text):
+                    cut = probe_end
+                    break
+
+            if not cut:
+                hard_end = end
+                hard_chars = chars
+                while hard_end < total:
+                    text_len = len(cues[hard_end].text)
+                    if hard_end - start >= self._batch_size or hard_chars + text_len > self._batch_chars:
+                        break
+                    hard_chars += text_len
+                    hard_end += 1
+                cut = hard_end
+
+            chunks.append(cues[start:cut])
+            start = cut
         return chunks
+
+    def _generate_ai_glossary(
+        self,
+        batches: List[List[SubtitleCue]],
+        media_context: str,
+        ai_config: Dict[str, Any],
+    ) -> Dict[str, str]:
+        """Extract and merge a movie-wide AI glossary from all subtitle batches."""
+        glossary: Dict[str, str] = {}
+        seen = set()
+        logger.info(f"【{self.plugin_name}】开始生成 AI 术语表：{len(batches)} 个批次")
+        for batch_no, batch in enumerate(batches, start=1):
+            try:
+                terms = self._run_glossary_stage(batch_no, len(batches), batch, media_context, ai_config)
+                for term, translation in terms.items():
+                    key = self._glossary_key(term)
+                    if not key or key in seen:
+                        continue
+                    glossary[term.strip()] = translation.strip()
+                    seen.add(key)
+            except Exception as e:
+                logger.warning(
+                    f"【{self.plugin_name}】术语抽取批次 {batch_no}/{len(batches)} 失败，"
+                    f"跳过该批次继续翻译：{e}"
+                )
+        logger.info(f"【{self.plugin_name}】AI 术语表生成完成：{len(glossary)} 条")
+        return glossary
+
+    def _run_glossary_stage(
+        self,
+        batch_no: int,
+        total_batches: int,
+        batch: List[SubtitleCue],
+        media_context: str,
+        ai_config: Dict[str, Any],
+    ) -> Dict[str, str]:
+        """Run the cached glossary_gen stage for one subtitle batch."""
+        items = [
+            {"index": cue.index, "text": self._plain_subtitle_text(cue.text)}
+            for cue in batch
+        ]
+        cache_key = self._translation_cache_key(
+            "glossary_gen",
+            items,
+            media_context,
+            previous=None,
+            ai_config=ai_config,
+            glossary_text=self._glossary,
+        )
+        cached = self._load_glossary_cache(cache_key)
+        if cached is not None:
+            logger.info(f"【{self.plugin_name}】术语抽取命中缓存：batch {batch_no}/{total_batches}，{len(cached)} 条")
+            return cached
+
+        payload = {"items": items}
+        prompt = self._translation_prompt("glossary_gen", media_context, self._glossary)
+        last_error = None
+        attempts = self._api_retries + 1
+        for attempt in range(attempts):
+            try:
+                content = self._chat_completion([
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ], ai_config)
+                parsed = self._parse_glossary_response(content)
+                self._save_glossary_cache(cache_key, parsed, ai_config)
+                logger.info(
+                    f"【{self.plugin_name}】术语抽取完成：batch {batch_no}/{total_batches}，"
+                    f"{len(parsed)} 条"
+                )
+                return parsed
+            except Exception as e:
+                last_error = e
+                if attempt >= attempts - 1:
+                    break
+                delay = max(1, self._api_timeout // 60) * (attempt + 1)
+                logger.warning(
+                    f"【{self.plugin_name}】术语抽取失败，"
+                    f"{delay}s 后重试 {attempt + 1}/{self._api_retries}：{e}"
+                )
+                time.sleep(delay)
+        raise RuntimeError(f"术语抽取失败，已重试 {self._api_retries} 次：{last_error}")
+
+    def _parse_glossary_response(self, content: str) -> Dict[str, str]:
+        """Parse a glossary_gen JSON array into a term-to-translation mapping."""
+        data = json.loads(self._extract_json_array(content))
+        result: Dict[str, str] = {}
+        for item in data:
+            term = str(item.get("term") or "").strip()
+            translation = str(item.get("translation") or "").strip()
+            if term and translation:
+                result[term] = translation
+        return result
+
+    def _load_glossary_cache(self, cache_key: str) -> Optional[Dict[str, str]]:
+        """Load cached glossary_gen output from the existing translation cache directory."""
+        if not self._cache_enabled:
+            return None
+        path = self._translation_cache_path(cache_key)
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            result = data.get("result") or []
+            return {
+                str(item.get("term") or "").strip(): str(item.get("translation") or "").strip()
+                for item in result
+                if str(item.get("term") or "").strip() and str(item.get("translation") or "").strip()
+            }
+        except Exception as e:
+            logger.warning(f"【{self.plugin_name}】读取术语缓存失败：{path}，{e}")
+            return None
+
+    def _save_glossary_cache(self, cache_key: str, result: Dict[str, str], ai_config: Dict[str, Any]):
+        """Save glossary_gen output using the existing translation cache file layout."""
+        if not self._cache_enabled:
+            return
+        path = self._translation_cache_path(cache_key)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "created_at": self._now_text(),
+                "source": ai_config.get("source"),
+                "model": ai_config.get("model"),
+                "target_language": self._target_language,
+                "translation_profile": self._translation_profile,
+                "result": [
+                    {"term": term, "translation": translation}
+                    for term, translation in sorted(result.items(), key=lambda item: item[0].lower())
+                ],
+            }
+            tmp_path = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")
+            tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp_path.replace(path)
+        except Exception as e:
+            logger.warning(f"【{self.plugin_name}】写入术语缓存失败：{path}，{e}")
+
+    def _build_effective_glossary(self, ai_glossary: Dict[str, str]) -> str:
+        """Merge AI and user glossary entries, with user-provided terms taking priority."""
+        merged: Dict[str, Tuple[str, str]] = {}
+        for term, translation in (ai_glossary or {}).items():
+            key = self._glossary_key(term)
+            if key and translation:
+                merged[key] = (term.strip(), translation.strip())
+        user_glossary = self._parse_user_glossary()
+        for term, translation in user_glossary.items():
+            key = self._glossary_key(term)
+            if key and translation:
+                merged[key] = (term.strip(), translation.strip())
+        lines = [
+            f"{term}={translation}"
+            for term, translation in sorted(merged.values(), key=lambda item: item[0].lower())
+        ]
+        raw_user_glossary = (self._glossary or "").strip()
+        if raw_user_glossary and not user_glossary:
+            lines.append(raw_user_glossary)
+        return "\n".join(lines)
+
+    def _parse_user_glossary(self) -> Dict[str, str]:
+        """Parse the free-form user glossary textarea into term translations."""
+        text = (self._glossary or "").strip()
+        if not text:
+            return {}
+        parsed: Dict[str, str] = {}
+        if text.startswith("["):
+            try:
+                for item in json.loads(self._extract_json_array(text)):
+                    term = str(item.get("term") or item.get("source") or "").strip()
+                    translation = str(item.get("translation") or item.get("target") or item.get("text") or "").strip()
+                    if term and translation:
+                        parsed[term] = translation
+                return parsed
+            except Exception:
+                parsed.clear()
+        for line in text.splitlines():
+            line = line.strip().strip(",;；")
+            if not line:
+                continue
+            for separator in ["=>", "=", "：", ":"]:
+                if separator in line:
+                    term, translation = line.split(separator, 1)
+                    term = term.strip()
+                    translation = translation.strip()
+                    if term and translation:
+                        parsed[term] = translation
+                    break
+        return parsed
+
+    @staticmethod
+    def _glossary_key(term: str) -> str:
+        """Normalize glossary terms for duplicate detection and user override matching."""
+        return re.sub(r"\s+", " ", term or "").strip().lower()
+
+    def _glossary_prompt(self, media_context: str, glossary: str) -> str:
+        """Build the glossary_gen prompt for extracting reusable subtitle terms."""
+        return (
+            "你是专业影视字幕术语编辑。你必须只返回 JSON 数组，不要 Markdown，不要解释。"
+            "数组元素格式为 {\"term\": \"英文术语\", \"translation\": \"简体中文译名\"}。"
+            "从输入字幕中抽取需要全片保持一致的专有名词：人名、地名、组织名、作品名、世界观术语、固定称谓和关键技术词。"
+            "不要返回普通词、代词、语气词、整句台词或只在单句中出现且不影响一致性的词。"
+            "translation 要短、自然、适合影视字幕；不确定时给出最可能的简体中文译名，必要时可保留英文。"
+            "同一术语只返回一次；不要输出时间轴，不要输出字幕正文。"
+            f"\n影片上下文：{media_context or '未知'}"
+            f"\n已有手填术语（优先级更高，避免生成冲突译名）：{glossary or '无'}"
+        )
+
+    def _compress_prompt(self, media_context: str, glossary: str) -> str:
+        """Build the compress prompt for shortening line-length violations."""
+        return (
+            "你是专业影视字幕压缩编辑。你必须只返回 JSON 数组，不要 Markdown，不要解释。"
+            "数组元素格式为 {\"index\": 数字, \"text\": \"压缩后的译文\"}。"
+            "必须保留 index，不要合并、拆分、增删条目；不要输出时间轴，不要输出原文。"
+            "输入 items 中的 text 是已润色译文，violations 是超标原因。"
+            "任务是在不改变人物、事实、语气和术语的前提下压缩译文。"
+            "每条字幕最多两行；中文每行建议不超过 16 字符，英文每行不超过 42 字符；每秒阅读量不超过 15 字符。"
+            "可以用一个换行把译文分成两行，但不要超过两行。"
+            f"\n影片上下文：{media_context or '未知'}"
+            f"\n术语表：{glossary or '无'}"
+        )
+
+    def _validate_line_length(
+        self,
+        cues: List[SubtitleCue],
+        media_context: str = "",
+        ai_config: Optional[Dict[str, Any]] = None,
+        glossary_text: str = "",
+    ) -> List[SubtitleCue]:
+        """Validate translated subtitle length and compress only entries that exceed limits."""
+        if not self._enable_line_check or not self._ai_enabled or not ai_config:
+            return cues
+        issues = []
+        for cue in cues:
+            violations = self._line_length_violations(cue)
+            if violations:
+                issues.append((cue, violations))
+        if not issues:
+            return cues
+
+        logger.info(f"【{self.plugin_name}】字幕长度校验发现超标条目：{len(issues)} 条，开始压缩")
+        compressed = self._compress_line_length_issues(issues, media_context, ai_config, glossary_text)
+        if not compressed:
+            return cues
+
+        output = []
+        for cue in cues:
+            text = compressed.get(cue.index)
+            if text:
+                output.append(SubtitleCue(
+                    index=cue.index,
+                    start=cue.start,
+                    end=cue.end,
+                    text=text,
+                    line_index=cue.line_index,
+                    ass_fields=list(cue.ass_fields) if cue.ass_fields else None,
+                    ass_text_index=cue.ass_text_index,
+                ))
+            else:
+                output.append(cue)
+        return output
+
+    def _line_length_violations(self, cue: SubtitleCue) -> List[str]:
+        """Return Netflix-style line count, line length, and CPS violations for one cue."""
+        text = self._plain_subtitle_text(cue.text)
+        if not text:
+            return []
+        lines = [line.strip() for line in text.replace("\\N", "\n").splitlines() if line.strip()]
+        if not lines:
+            return []
+
+        violations = []
+        chinese_limit = bool(re.search(r"[\u4e00-\u9fff]", text))
+        line_limit = 16 if chinese_limit else 42
+        if len(lines) > 2:
+            violations.append(f"超过两行：{len(lines)} 行")
+        for line_no, line in enumerate(lines, start=1):
+            if len(line) > line_limit:
+                violations.append(f"第 {line_no} 行 {len(line)} 字符，限制 {line_limit}")
+        duration = self._cue_duration_seconds(cue)
+        readable_chars = len(re.sub(r"\s+", "", text))
+        if duration > 0:
+            cps = readable_chars / duration
+            if cps > 15:
+                violations.append(f"CPS {cps:.1f}，限制 15")
+        return violations
+
+    def _compress_line_length_issues(
+        self,
+        issues: List[Tuple[SubtitleCue, List[str]]],
+        media_context: str,
+        ai_config: Dict[str, Any],
+        glossary_text: str,
+    ) -> Dict[int, str]:
+        """Run the cached compress stage and return successful per-index replacements."""
+        items = []
+        for cue, violations in issues:
+            duration = self._cue_duration_seconds(cue)
+            items.append({
+                "index": cue.index,
+                "text": self._plain_subtitle_text(cue.text),
+                "violations": "；".join(violations),
+                "duration_seconds": round(duration, 3) if duration > 0 else 0,
+                "limits": "中文每行<=16；英文每行<=42；每条<=2行；CPS<=15",
+            })
+        try:
+            return self._translate_stage(
+                stage="compress",
+                items=items,
+                media_context=media_context,
+                previous=None,
+                ai_config=ai_config,
+                glossary_text=glossary_text,
+            )
+        except Exception as e:
+            logger.warning(f"【{self.plugin_name}】字幕压缩失败，保留润色译文继续输出：{e}")
+            return {}
+
+    def _cue_duration_seconds(self, cue: SubtitleCue) -> float:
+        """Calculate cue duration in seconds from SRT or ASS timestamp strings."""
+        start = self._parse_subtitle_time(cue.start)
+        end = self._parse_subtitle_time(cue.end)
+        if start is None or end is None:
+            return 0.0
+        return max(end - start, 0.0)
+
+    @staticmethod
+    def _parse_subtitle_time(value: str) -> Optional[float]:
+        """Parse SRT/ASS timestamps such as 00:01:02,345 or 0:01:02.34."""
+        match = re.match(r"^\s*(\d+):(\d{1,2}):(\d{1,2})(?:[,.](\d+))?\s*$", value or "")
+        if not match:
+            return None
+        hours = int(match.group(1))
+        minutes = int(match.group(2))
+        seconds = int(match.group(3))
+        fraction = match.group(4) or ""
+        fraction_seconds = float(f"0.{fraction}") if fraction else 0.0
+        return hours * 3600 + minutes * 60 + seconds + fraction_seconds
+
+    @staticmethod
+    def _extract_json_array(content: str) -> str:
+        """Extract the first JSON array from a model response, allowing fenced JSON."""
+        text = (content or "").strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+            text = re.sub(r"```$", "", text).strip()
+        start = text.find("[")
+        end = text.rfind("]")
+        if start >= 0 and end > start:
+            return text[start:end + 1]
+        return text
+
+    @staticmethod
+    def _is_sentence_boundary(text: str) -> bool:
+        """Return True when subtitle text ends with a sentence-ending punctuation mark."""
+        cleaned = SubtitleHunter._plain_subtitle_text(text)
+        return bool(re.search(r"(?:\.{3}|[.!?。！？]|…+)[\"'）)\]\}”’]*\s*$", cleaned))
 
     def _parse_srt(self, content: str) -> List[SubtitleCue]:
         normalized = content.replace("\r\n", "\n").replace("\r", "\n").strip()
@@ -1488,6 +1891,7 @@ class SubtitleHunter(_PluginBase):
             "target_language": self._target_language,
             "translation_suffix": self._translation_suffix,
             "glossary": self._glossary,
+            "enable_line_check": self._enable_line_check,
             "ffmpeg_timeout": self._ffmpeg_timeout,
         }
 
@@ -1785,6 +2189,18 @@ class SubtitleHunter(_PluginBase):
                                         "model": "batch_chars",
                                         "label": "每批最大字符",
                                         "type": "number",
+                                    },
+                                }],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [{
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "enable_line_check",
+                                        "label": "启用行长度校验",
+                                        "hint": "按 Netflix 行长和 CPS 标准压缩超长译文",
                                     },
                                 }],
                             },
