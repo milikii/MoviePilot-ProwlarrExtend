@@ -1,6 +1,7 @@
 # _*_ coding: utf-8 _*_
 import hashlib
 import json
+import os
 import re
 import subprocess
 import threading
@@ -68,7 +69,7 @@ class SubtitleHunter(_PluginBase):
     plugin_name = "SubtitleHunter"
     plugin_desc = "入库后自动检测、提取、翻译并规范化字幕"
     plugin_icon = "subtitle.png"
-    plugin_version = "2.9"
+    plugin_version = "2.10"
     plugin_author = "milikii"
     author_url = "https://github.com/milikii"
     plugin_config_prefix = "subtitle_hunter_"
@@ -176,6 +177,10 @@ class SubtitleHunter(_PluginBase):
             self._ffmpeg_timeout = self._safe_int(config.get("ffmpeg_timeout"), 600, 60, 7200)
 
         self._init_runtime_status()
+        try:
+            self._load_runtime_state()
+        except Exception as e:
+            logger.warning(f"【{self.plugin_name}】加载运行状态失败：{e}")
 
         if config_changed and not self._onlyonce:
             self.update_config(self._current_config())
@@ -1933,6 +1938,9 @@ class SubtitleHunter(_PluginBase):
         except Exception as e:
             logger.warning(f"【{self.plugin_name}】发送通知失败：{e}")
 
+    def _runtime_state_path(self) -> Path:
+        return self.get_data_path() / "runtime_state.json"
+
     def _init_runtime_status(self):
         self._status_lock = threading.Lock()
         self._runtime = {
@@ -1961,6 +1969,60 @@ class SubtitleHunter(_PluginBase):
             "translation_batches_done": 0,
         }
         self._history = []
+
+    def _load_runtime_state(self):
+        try:
+            path = self._runtime_state_path()
+            if not path.exists():
+                return
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                return
+            if not isinstance(payload, dict):
+                return
+
+            runtime = payload.get("runtime")
+            history = payload.get("history")
+            if not isinstance(runtime, dict):
+                runtime = {}
+            if not isinstance(history, list):
+                history = []
+
+            fields = (
+                "status", "source", "media", "target_path", "started_at", "finished_at",
+                "duration", "videos", "subtitles", "processed", "skipped", "extracted",
+                "translated", "renamed", "failed", "last_video", "message", "error",
+                "errors", "details", "translation_batches_total", "translation_batches_done",
+            )
+            with self._status_lock:
+                self._history = [dict(item) for item in history if isinstance(item, dict)][:10]
+                self._runtime.update({key: runtime[key] for key in fields if key in runtime})
+                self._runtime["running"] = False
+                if self._runtime.get("status") == "运行中":
+                    self._runtime["status"] = "已中断"
+        except OSError as e:
+            logger.warning(f"【{self.plugin_name}】读取运行状态失败：{e}")
+        except Exception as e:
+            logger.warning(f"【{self.plugin_name}】加载运行状态失败：{e}")
+
+    def _save_runtime_state(self):
+        try:
+            path = self._runtime_state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with self._status_lock:
+                payload = {
+                    "runtime": dict(self._runtime),
+                    "history": [dict(item) for item in self._history[:10]],
+                }
+            tmp_path = path.with_name(f"{path.name}.tmp")
+            tmp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            os.replace(tmp_path, path)
+        except Exception as e:
+            logger.warning(f"【{self.plugin_name}】保存运行状态失败：{e}")
 
     def _ensure_runtime_status(self):
         if not hasattr(self, "_status_lock"):
@@ -2025,6 +2087,7 @@ class SubtitleHunter(_PluginBase):
             }
             self._history.insert(0, record)
             self._history = self._history[:10]
+        self._save_runtime_state()
 
     def _runtime_snapshot(self) -> Dict[str, Any]:
         self._ensure_runtime_status()
@@ -2191,14 +2254,14 @@ class SubtitleHunter(_PluginBase):
         return f"{text[:max(limit - 3, 0)]}..."
 
     def _estimate_scan_subtitle_chars(self, tracks: List[SubtitleTrack]) -> int:
-        """Estimate subtitle text size from scanned text-based external subtitle files."""
+        """Estimate subtitle text size from scanned text-based external subtitle files using actual UTF-8 character count."""
         total = 0
         for track in tracks:
             if not track.text_based or not track.path:
                 continue
             try:
                 if track.path.exists():
-                    total += track.path.stat().st_size
+                    total += len(track.path.read_text(encoding="utf-8", errors="ignore"))
             except OSError:
                 continue
         return total
