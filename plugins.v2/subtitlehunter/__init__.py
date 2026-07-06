@@ -125,7 +125,7 @@ class SubtitleHunter(_PluginBase):
         self._api_model = "gpt-4o-mini"
         self._api_use_proxy = False
         self._api_timeout = 180
-        self._api_retries = 3
+        self._api_retries = 10
         self._batch_size = 60
         self._batch_chars = 9000
         self._parallel_batches = 5
@@ -157,7 +157,7 @@ class SubtitleHunter(_PluginBase):
             self._api_model = config.get("api_model", self._api_model) or self._api_model
             self._api_use_proxy = bool(config.get("api_use_proxy", False))
             self._api_timeout = self._safe_int(config.get("api_timeout"), 180, 15, 600)
-            self._api_retries = self._safe_int(config.get("api_retries"), 3, 0, 10)
+            self._api_retries = self._safe_int(config.get("api_retries"), 10, 0, 100)
             self._batch_size = self._safe_int(config.get("batch_size"), 60, 5, 200)
             self._batch_chars = self._safe_int(config.get("batch_chars"), 9000, 1000, 30000)
             self._parallel_batches = self._safe_int(config.get("parallel_batches"), 5, 1, 20)
@@ -949,7 +949,6 @@ class SubtitleHunter(_PluginBase):
         }
         prompt = self._translation_prompt(stage, media_context, glossary_text)
         requested_indexes = {int(item["index"]) for item in items}
-        last_error = None
         attempts = self._api_retries + 1
 
         for attempt in range(attempts):
@@ -969,8 +968,9 @@ class SubtitleHunter(_PluginBase):
                 self._save_translation_cache(cache_key, parsed, ai_config)
                 logger.info(f"【{self.plugin_name}】{stage_name}完成：{len(parsed)} 条")
                 return parsed
+            except MemoryError:
+                raise
             except Exception as e:
-                last_error = e
                 if attempt >= attempts - 1:
                     break
                 delay = max(1, self._api_timeout // 60) * (attempt + 1)
@@ -980,7 +980,35 @@ class SubtitleHunter(_PluginBase):
                 )
                 time.sleep(delay)
 
-        raise RuntimeError(f"{stage_name}失败，已重试 {self._api_retries} 次：{last_error}")
+        attempt = self._api_retries + 1
+        logger.warning(f"【{self.plugin_name}】{stage_name}进入慢重试，将一直重试到成功")
+        while True:
+            try:
+                content = self._chat_completion([
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ], ai_config)
+                parsed = self._parse_translation_response(content)
+                if not parsed:
+                    raise RuntimeError(f"{stage_name}返回为空：{content[:200]}")
+                missing = requested_indexes - set(parsed.keys())
+                if missing and stage != "compress":
+                    raise RuntimeError(f"{stage_name}返回缺少字幕索引：{sorted(missing)[:10]}")
+                if missing:
+                    logger.warning(f"【{self.plugin_name}】{stage_name}返回缺少字幕索引，缺失条目保留原文：{sorted(missing)[:10]}")
+                self._save_translation_cache(cache_key, parsed, ai_config)
+                logger.info(f"【{self.plugin_name}】{stage_name}完成：{len(parsed)} 条")
+                return parsed
+            except MemoryError:
+                raise
+            except Exception as e:
+                delay = self._retry_backoffdelay(attempt)
+                logger.warning(
+                    f"【{self.plugin_name}】{stage_name}慢重试 #{attempt}：{e}，"
+                    f"{delay}s 后再试"
+                )
+                time.sleep(delay)
+                attempt += 1
 
     def _translation_cache_key(
         self,
@@ -1128,6 +1156,15 @@ class SubtitleHunter(_PluginBase):
             result[index] = value
         return result
 
+    @staticmethod
+    def _retry_backoffdelay(attempt: int) -> int:
+        base = 5
+        attempt = max(0, attempt)
+        if attempt >= 6:
+            return 300
+        delay = min(base * (2 ** attempt), 300)
+        return int(delay)
+
     def _chunk_cues(self, cues: List[SubtitleCue]) -> List[List[SubtitleCue]]:
         chunks = []
         lookahead = 5
@@ -1234,7 +1271,6 @@ class SubtitleHunter(_PluginBase):
 
         payload = {"items": items}
         prompt = self._translation_prompt("glossary_gen", media_context, self._glossary)
-        last_error = None
         attempts = self._api_retries + 1
         for attempt in range(attempts):
             try:
@@ -1249,8 +1285,9 @@ class SubtitleHunter(_PluginBase):
                     f"{len(parsed)} 条"
                 )
                 return parsed
+            except MemoryError:
+                raise
             except Exception as e:
-                last_error = e
                 if attempt >= attempts - 1:
                     break
                 delay = max(1, self._api_timeout // 60) * (attempt + 1)
@@ -1259,7 +1296,32 @@ class SubtitleHunter(_PluginBase):
                     f"{delay}s 后重试 {attempt + 1}/{self._api_retries}：{e}"
                 )
                 time.sleep(delay)
-        raise RuntimeError(f"术语抽取失败，已重试 {self._api_retries} 次：{last_error}")
+
+        attempt = self._api_retries + 1
+        logger.warning(f"【{self.plugin_name}】术语抽取进入慢重试，将一直重试到成功")
+        while True:
+            try:
+                content = self._chat_completion([
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ], ai_config)
+                parsed = self._parse_glossary_response(content)
+                self._save_glossary_cache(cache_key, parsed, ai_config)
+                logger.info(
+                    f"【{self.plugin_name}】术语抽取完成：batch {batch_no}/{total_batches}，"
+                    f"{len(parsed)} 条"
+                )
+                return parsed
+            except MemoryError:
+                raise
+            except Exception as e:
+                delay = self._retry_backoffdelay(attempt)
+                logger.warning(
+                    f"【{self.plugin_name}】术语抽取慢重试 #{attempt}：{e}，"
+                    f"{delay}s 后再试"
+                )
+                time.sleep(delay)
+                attempt += 1
 
     def _parse_glossary_response(self, content: str) -> Dict[str, str]:
         """Parse a glossary_gen JSON array into a term-to-translation mapping."""
@@ -2212,6 +2274,7 @@ class SubtitleHunter(_PluginBase):
                                         "model": "api_retries",
                                         "label": "API 重试次数",
                                         "type": "number",
+                                        "hint": "默认 10；失败会一直重试到拿结果为止，这里只是单段重试上限。设大点没坏处",
                                     },
                                 }],
                             },
