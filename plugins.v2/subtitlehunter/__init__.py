@@ -68,7 +68,7 @@ class SubtitleHunter(_PluginBase):
     plugin_name = "SubtitleHunter"
     plugin_desc = "入库后自动检测、提取、翻译并规范化字幕"
     plugin_icon = "subtitle.png"
-    plugin_version = "2.7"
+    plugin_version = "2.8"
     plugin_author = "milikii"
     author_url = "https://github.com/milikii"
     plugin_config_prefix = "subtitle_hunter_"
@@ -108,6 +108,7 @@ class SubtitleHunter(_PluginBase):
     )
 
     def init_plugin(self, config: dict = None):
+        config_changed = False
         self._enabled = False
         self._notify = True
         self._onlyonce = False
@@ -158,6 +159,9 @@ class SubtitleHunter(_PluginBase):
             self._api_use_proxy = bool(config.get("api_use_proxy", False))
             self._api_timeout = self._safe_int(config.get("api_timeout"), 180, 15, 600)
             self._api_retries = self._safe_int(config.get("api_retries"), 10, 0, 100)
+            if self._api_retries < 10:
+                self._api_retries = 10
+                config_changed = True
             self._batch_size = self._safe_int(config.get("batch_size"), 60, 5, 200)
             self._batch_chars = self._safe_int(config.get("batch_chars"), 9000, 1000, 30000)
             self._parallel_batches = self._safe_int(config.get("parallel_batches"), 5, 1, 20)
@@ -173,10 +177,13 @@ class SubtitleHunter(_PluginBase):
 
         self._init_runtime_status()
 
+        if config_changed and not self._onlyonce:
+            self.update_config(self._current_config())
+
         if self._onlyonce:
             self._onlyonce = False
             self.update_config(self._current_config(onlyonce=False))
-            if self._target_path:
+            if self._split_target_paths(self._target_path):
                 self._start_background_job(
                     source="手动运行",
                     target_path=self._target_path,
@@ -217,6 +224,11 @@ class SubtitleHunter(_PluginBase):
 
         if not self._target_path:
             message = "未配置媒体目录或视频路径"
+            logger.warning(f"【{self.plugin_name}】定时任务跳过：{message}")
+            self._send_notify("定时任务跳过", self._build_skip_notify_text(message))
+            return
+        if not self._split_target_paths(self._target_path):
+            message = "媒体目录或视频路径为空"
             logger.warning(f"【{self.plugin_name}】定时任务跳过：{message}")
             self._send_notify("定时任务跳过", self._build_skip_notify_text(message))
             return
@@ -292,11 +304,21 @@ class SubtitleHunter(_PluginBase):
         )
 
     def api_list_subtitles(self, path: str = "") -> Dict[str, Any]:
-        target = self._resolve_target_path(path or self._target_path)
-        result = self._scan_target(target)
+        target_paths = self._split_target_paths(path or self._target_path)
+        if not target_paths:
+            return {"success": False, "message": "未指定 path"}
+
+        targets = [self._resolve_target_path(item) for item in target_paths]
+        result = {"videos": [], "subtitles": [], "errors": []}
+        for target in targets:
+            scan = self._scan_target(target)
+            result["videos"].extend(scan["videos"])
+            result["subtitles"].extend(scan["subtitles"])
+            result["errors"].extend(scan["errors"])
         return {
             "success": True,
-            "target": str(target),
+            "target": ",".join(str(target) for target in targets),
+            "targets": [str(target) for target in targets],
             "videos": [str(video) for video in result["videos"]],
             "subtitles": [track.to_dict() for track in result["subtitles"]],
             "errors": result["errors"],
@@ -305,14 +327,15 @@ class SubtitleHunter(_PluginBase):
     def api_ensure_chinese(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload = payload or {}
         target_path = payload.get("path") or self._target_path
-        if not target_path:
+        target_paths = self._split_target_paths(target_path)
+        if not target_paths:
             return {"success": False, "message": "未指定 path"}
         self._start_background_job(
             source="API确保中文字幕",
             target_path=target_path,
             mediainfo=None,
         )
-        return {"success": True, "message": "任务已提交", "target": target_path}
+        return {"success": True, "message": "任务已提交", "target": target_path, "targets": target_paths}
 
     def api_extract_subtitles(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload = payload or {}
@@ -350,7 +373,21 @@ class SubtitleHunter(_PluginBase):
         target_path: str,
         mediainfo: Optional[MediaInfo],
     ):
-        target = self._resolve_target_path(target_path)
+        targets = [self._resolve_target_path(item) for item in self._split_target_paths(target_path)]
+        if not targets:
+            logger.warning(f"【{self.plugin_name}】未指定媒体目录或视频路径，任务未启动")
+            return
+        if len(targets) > 1:
+            title = f"{len(targets)} 个目标"
+            threading.Thread(
+                target=self._ensure_multiple_targets_workflow,
+                args=(source, targets),
+                daemon=True,
+                name=f"SubtitleHunter-{title}",
+            ).start()
+            return
+
+        target = targets[0]
         title = self._media_title(mediainfo, target)
         threading.Thread(
             target=self._ensure_chinese_workflow,
@@ -358,6 +395,18 @@ class SubtitleHunter(_PluginBase):
             daemon=True,
             name=f"SubtitleHunter-{title}",
         ).start()
+
+    def _ensure_multiple_targets_workflow(
+        self,
+        source: str,
+        targets: List[Path],
+    ):
+        total = len(targets)
+        logger.info(f"【{self.plugin_name}】开始多目标字幕任务：{total} 个目标")
+        for index, target in enumerate(targets, start=1):
+            title = self._media_title(None, target)
+            scoped_source = f"{source} {index}/{total}"
+            self._ensure_chinese_workflow(scoped_source, target, title, None)
 
     def _ensure_chinese_workflow(
         self,
@@ -1801,6 +1850,13 @@ class SubtitleHunter(_PluginBase):
         return Path(target_path).expanduser()
 
     @staticmethod
+    def _split_target_paths(target_path: Any) -> List[str]:
+        text = str(target_path or "").strip()
+        if not text:
+            return []
+        return [item.strip() for item in re.split(r"[,，]", text) if item.strip()]
+
+    @staticmethod
     def _clean_text(value: Any) -> str:
         return str(value).strip() if value is not None else ""
 
@@ -2256,7 +2312,7 @@ class SubtitleHunter(_PluginBase):
                                         "model": "schedule_cron",
                                         "label": "定时执行周期",
                                         "placeholder": "0 3 * * *",
-                                        "hint": "5 位 cron；留空禁用定时；如 0 3 * * * 表示每天凌晨 3 点对 target_path 执行。当 ai_enabled 关闭时也能跑（仅提取/命名）。",
+                                        "hint": "5 位 cron；留空禁用定时；如 0 3 * * * 表示每天凌晨 3 点对媒体路径执行，多个路径会顺序处理。",
                                     },
                                 }],
                             },
@@ -2265,19 +2321,6 @@ class SubtitleHunter(_PluginBase):
                     {
                         "component": "VRow",
                         "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [{
-                                    "component": "VTextField",
-                                    "props": {
-                                        "model": "api_retries",
-                                        "label": "API 重试次数",
-                                        "type": "number",
-                                        "hint": "默认 10；失败会一直重试到拿结果为止，这里只是单段重试上限。设大点没坏处",
-                                    },
-                                }],
-                            },
                             {
                                 "component": "VCol",
                                 "props": {"cols": 12, "md": 4},
@@ -2303,8 +2346,8 @@ class SubtitleHunter(_PluginBase):
                                     "props": {
                                         "model": "target_path",
                                         "label": "媒体目录或视频路径",
-                                        "placeholder": "/media/Movies/Movie.Name.2026/Movie.Name.2026.mkv",
-                                        "hint": "用于立即运行一次，也可通过 API 指定 path",
+                                        "placeholder": "/media/Movies,/media/TV/Show.Name.2026",
+                                        "hint": "支持目录或单个视频；多个路径用英文逗号分隔，会按顺序处理。也可通过 API 指定 path。",
                                     },
                                 }],
                             },
