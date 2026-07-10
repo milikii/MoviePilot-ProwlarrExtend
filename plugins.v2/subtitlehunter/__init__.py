@@ -69,7 +69,7 @@ class SubtitleHunter(_PluginBase):
     plugin_name = "SubtitleHunter"
     plugin_desc = "入库后自动检测、提取、翻译并规范化字幕"
     plugin_icon = "subtitle.png"
-    plugin_version = "2.10"
+    plugin_version = "2.11"
     plugin_author = "milikii"
     author_url = "https://github.com/milikii"
     plugin_config_prefix = "subtitle_hunter_"
@@ -335,11 +335,13 @@ class SubtitleHunter(_PluginBase):
         target_paths = self._split_target_paths(target_path)
         if not target_paths:
             return {"success": False, "message": "未指定 path"}
-        self._start_background_job(
+        started = self._start_background_job(
             source="API确保中文字幕",
             target_path=target_path,
             mediainfo=None,
         )
+        if not started:
+            return {"success": False, "message": "已有字幕任务正在运行", "target": target_path}
         return {"success": True, "message": "任务已提交", "target": target_path, "targets": target_paths}
 
     def api_extract_subtitles(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -377,29 +379,58 @@ class SubtitleHunter(_PluginBase):
         source: str,
         target_path: str,
         mediainfo: Optional[MediaInfo],
-    ):
+    ) -> bool:
         targets = [self._resolve_target_path(item) for item in self._split_target_paths(target_path)]
         if not targets:
             logger.warning(f"【{self.plugin_name}】未指定媒体目录或视频路径，任务未启动")
-            return
+            return False
+
+        self._ensure_runtime_status()
+        with self._status_lock:
+            if self._job_active:
+                logger.warning(f"【{self.plugin_name}】已有字幕任务正在运行，跳过：{source}")
+                return False
+            self._job_active = True
+
         if len(targets) > 1:
             title = f"{len(targets)} 个目标"
+            job = self._ensure_multiple_targets_workflow
+            args = (source, targets)
+        else:
+            target = targets[0]
+            title = self._media_title(mediainfo, target)
+            job = self._ensure_chinese_workflow
+            args = (source, target, title, mediainfo)
+
+        try:
             threading.Thread(
-                target=self._ensure_multiple_targets_workflow,
-                args=(source, targets),
+                target=self._run_reserved_job,
+                args=(job, args),
                 daemon=True,
                 name=f"SubtitleHunter-{title}",
             ).start()
-            return
+            return True
+        except Exception:
+            with self._status_lock:
+                self._job_active = False
+            raise
 
-        target = targets[0]
-        title = self._media_title(mediainfo, target)
-        threading.Thread(
-            target=self._ensure_chinese_workflow,
-            args=(source, target, title, mediainfo),
-            daemon=True,
-            name=f"SubtitleHunter-{title}",
-        ).start()
+    def _run_reserved_job(self, job, args: Tuple[Any, ...]):
+        try:
+            job(*args)
+        except Exception as e:
+            error = traceback.format_exc()
+            logger.error(f"【{self.plugin_name}】字幕任务启动后异常退出：{e}\n{error}")
+            self._update_run(
+                running=False,
+                status="失败",
+                message=f"字幕任务异常退出：{e}",
+                error=error,
+            )
+        finally:
+            self._ensure_runtime_status()
+            with self._status_lock:
+                self._job_active = False
 
     def _ensure_multiple_targets_workflow(
         self,
@@ -540,8 +571,15 @@ class SubtitleHunter(_PluginBase):
                     external_tracks = self._find_external_subtitles(video_path)
                     all_tracks = external_tracks + embedded_tracks
 
-            chinese_tracks = [track for track in all_tracks if self._is_chinese_language(track.language, track.title, track.path)]
-            external_chinese = [track for track in chinese_tracks if track.source == "external"]
+            chinese_tracks = [
+                track for track in all_tracks
+                if not track.forced
+                and self._is_chinese_language(track.language, track.title, track.path)
+            ]
+            external_chinese = [
+                track for track in chinese_tracks
+                if track.source == "external" and self._is_usable_external_chinese_track(track)
+            ]
             if external_chinese:
                 detail["status"] = "已有中文"
                 detail["message"] = f"已有外挂中文字幕：{external_chinese[0].path}"
@@ -574,7 +612,11 @@ class SubtitleHunter(_PluginBase):
                 return detail
 
             translated_path = self._translated_subtitle_path(video_path, english_source)
-            if translated_path.exists() and not self._overwrite:
+            if (
+                translated_path.exists()
+                and not self._overwrite
+                and self._subtitle_file_has_chinese_text(translated_path)
+            ):
                 detail["status"] = "已有中文"
                 detail["message"] = f"翻译字幕已存在：{translated_path}"
                 return detail
@@ -601,6 +643,30 @@ class SubtitleHunter(_PluginBase):
             detail["errors"].append(traceback.format_exc())
             logger.error(f"【{self.plugin_name}】处理视频失败：{video_path}，{e}\n{traceback.format_exc()}")
             return detail
+
+    def _is_usable_external_chinese_track(self, track: SubtitleTrack) -> bool:
+        if track.forced or not track.path or not track.path.exists():
+            return False
+        if not track.text_based or track.path.suffix.lower() not in self._TRANSLATABLE_EXTS:
+            try:
+                return track.path.stat().st_size > 0
+            except OSError:
+                return False
+        return self._subtitle_file_has_chinese_text(track.path)
+
+    def _subtitle_file_has_chinese_text(self, path: Path) -> bool:
+        try:
+            content = path.read_text(encoding="utf-8-sig", errors="ignore")
+            suffix = path.suffix.lower()
+            if suffix == ".srt":
+                cues = self._parse_srt(content)
+            elif suffix in {".ass", ".ssa"}:
+                _, cues = self._parse_ass(content)
+            else:
+                return False
+            return self._has_chinese_cue_coverage(cues)
+        except (OSError, UnicodeError):
+            return False
 
     def _select_english_source(
         self,
@@ -808,23 +874,74 @@ class SubtitleHunter(_PluginBase):
         ai_config: Dict[str, Any],
     ) -> Tuple[bool, str]:
         suffix = source_path.suffix.lower()
+        temp_path: Optional[Path] = None
         try:
             content = source_path.read_text(encoding="utf-8-sig", errors="ignore")
             if suffix == ".srt":
                 cues = self._parse_srt(content)
-                translated = self._translate_cues(cues, media_context, ai_config)
-                output_path.write_text(self._render_srt(translated), encoding="utf-8")
+                renderer = self._render_srt
             elif suffix in {".ass", ".ssa"}:
                 lines, cues = self._parse_ass(content)
-                translated = self._translate_cues(cues, media_context, ai_config)
-                output_path.write_text(self._render_ass(lines, translated), encoding="utf-8")
+                renderer = lambda items: self._render_ass(lines, items)
             else:
                 return False, f"暂不支持翻译 {suffix} 字幕"
+
+            if not cues:
+                return False, "字幕翻译失败：未解析到有效字幕条目"
+
+            translated = self._translate_cues(cues, media_context, ai_config)
+            valid, reason = self._validate_translated_cues(cues, translated)
+            if not valid:
+                return False, f"字幕翻译失败：{reason}"
+
+            rendered = renderer(translated)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = output_path.with_name(
+                f".{output_path.name}.{threading.get_ident()}.tmp"
+            )
+            temp_path.write_text(rendered, encoding="utf-8")
+            os.replace(temp_path, output_path)
+            temp_path = None
             logger.info(f"【{self.plugin_name}】字幕翻译完成：{source_path} -> {output_path}")
             return True, f"翻译完成：{output_path}"
         except Exception as e:
             logger.error(f"【{self.plugin_name}】字幕翻译失败：{source_path}，{e}\n{traceback.format_exc()}")
             return False, f"字幕翻译失败：{e}"
+        finally:
+            if temp_path:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def _validate_translated_cues(
+        self,
+        source: List[SubtitleCue],
+        translated: List[SubtitleCue],
+    ) -> Tuple[bool, str]:
+        if len(translated) != len(source):
+            return False, f"字幕条目数不一致（原文 {len(source)}，译文 {len(translated)}）"
+        if [cue.index for cue in translated] != [cue.index for cue in source]:
+            return False, "字幕索引与原文不一致"
+
+        for source_cue, translated_cue in zip(source, translated):
+            if self._plain_subtitle_text(source_cue.text) and not self._plain_subtitle_text(translated_cue.text):
+                return False, f"字幕索引 {source_cue.index} 的译文为空"
+        if not self._has_chinese_cue_coverage(translated):
+            return False, "中文内容覆盖不足，模型可能未完成翻译"
+        return True, ""
+
+    def _has_chinese_cue_coverage(self, cues: List[SubtitleCue]) -> bool:
+        meaningful = 0
+        chinese = 0
+        for cue in cues:
+            text = self._plain_subtitle_text(cue.text)
+            if not re.search(r"[A-Za-z\u3400-\u4dbf\u4e00-\u9fff]", text):
+                continue
+            meaningful += 1
+            if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", text):
+                chinese += 1
+        return meaningful > 0 and chinese / meaningful >= 0.5
 
     def _translate_cues(
         self,
@@ -1036,38 +1153,7 @@ class SubtitleHunter(_PluginBase):
                 )
                 time.sleep(delay)
 
-        if stage == "compress":
-            raise RuntimeError(f"{stage_name}失败，已重试 {self._api_retries} 次：{last_error}")
-
-        attempt = self._api_retries + 1
-        logger.warning(f"【{self.plugin_name}】{stage_name}进入慢重试，将一直重试到成功")
-        while True:
-            try:
-                content = self._chat_completion([
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ], ai_config)
-                parsed = self._parse_translation_response(content)
-                if not parsed:
-                    raise RuntimeError(f"{stage_name}返回为空：{content[:200]}")
-                missing = requested_indexes - set(parsed.keys())
-                if missing and stage != "compress":
-                    raise RuntimeError(f"{stage_name}返回缺少字幕索引：{sorted(missing)[:10]}")
-                if missing:
-                    logger.warning(f"【{self.plugin_name}】{stage_name}返回缺少字幕索引，缺失条目保留原文：{sorted(missing)[:10]}")
-                self._save_translation_cache(cache_key, parsed, ai_config)
-                logger.info(f"【{self.plugin_name}】{stage_name}完成：{len(parsed)} 条")
-                return parsed
-            except MemoryError:
-                raise
-            except Exception as e:
-                delay = self._retry_backoffdelay(attempt)
-                logger.warning(
-                    f"【{self.plugin_name}】{stage_name}慢重试 #{attempt}：{e}，"
-                    f"{delay}s 后再试"
-                )
-                time.sleep(delay)
-                attempt += 1
+        raise RuntimeError(f"{stage_name}失败，已重试 {self._api_retries} 次：{last_error}")
 
     def _translation_cache_key(
         self,
@@ -1215,15 +1301,6 @@ class SubtitleHunter(_PluginBase):
             result[index] = value
         return result
 
-    @staticmethod
-    def _retry_backoffdelay(attempt: int) -> int:
-        base = 5
-        attempt = max(0, attempt)
-        if attempt >= 6:
-            return 300
-        delay = min(base * (2 ** attempt), 300)
-        return int(delay)
-
     def _chunk_cues(self, cues: List[SubtitleCue]) -> List[List[SubtitleCue]]:
         chunks = []
         lookahead = 5
@@ -1331,6 +1408,7 @@ class SubtitleHunter(_PluginBase):
         payload = {"items": items}
         prompt = self._translation_prompt("glossary_gen", media_context, self._glossary)
         attempts = self._api_retries + 1
+        last_error = None
         for attempt in range(attempts):
             try:
                 content = self._chat_completion([
@@ -1347,6 +1425,7 @@ class SubtitleHunter(_PluginBase):
             except MemoryError:
                 raise
             except Exception as e:
+                last_error = e
                 if attempt >= attempts - 1:
                     break
                 delay = max(1, self._api_timeout // 60) * (attempt + 1)
@@ -1355,32 +1434,7 @@ class SubtitleHunter(_PluginBase):
                     f"{delay}s 后重试 {attempt + 1}/{self._api_retries}：{e}"
                 )
                 time.sleep(delay)
-
-        attempt = self._api_retries + 1
-        logger.warning(f"【{self.plugin_name}】术语抽取进入慢重试，将一直重试到成功")
-        while True:
-            try:
-                content = self._chat_completion([
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ], ai_config)
-                parsed = self._parse_glossary_response(content)
-                self._save_glossary_cache(cache_key, parsed, ai_config)
-                logger.info(
-                    f"【{self.plugin_name}】术语抽取完成：batch {batch_no}/{total_batches}，"
-                    f"{len(parsed)} 条"
-                )
-                return parsed
-            except MemoryError:
-                raise
-            except Exception as e:
-                delay = self._retry_backoffdelay(attempt)
-                logger.warning(
-                    f"【{self.plugin_name}】术语抽取慢重试 #{attempt}：{e}，"
-                    f"{delay}s 后再试"
-                )
-                time.sleep(delay)
-                attempt += 1
+        raise RuntimeError(f"术语抽取失败，已重试 {self._api_retries} 次：{last_error}")
 
     def _parse_glossary_response(self, content: str) -> Dict[str, str]:
         """Parse a glossary_gen JSON array into a term-to-translation mapping."""
@@ -1943,6 +1997,7 @@ class SubtitleHunter(_PluginBase):
 
     def _init_runtime_status(self):
         self._status_lock = threading.Lock()
+        self._job_active = False
         self._runtime = {
             "running": False,
             "status": "未运行",
@@ -2027,6 +2082,8 @@ class SubtitleHunter(_PluginBase):
     def _ensure_runtime_status(self):
         if not hasattr(self, "_status_lock"):
             self._init_runtime_status()
+        elif not hasattr(self, "_job_active"):
+            self._job_active = False
 
     def _start_run(self, source: str, target: Path, display_name: str) -> float:
         self._ensure_runtime_status()

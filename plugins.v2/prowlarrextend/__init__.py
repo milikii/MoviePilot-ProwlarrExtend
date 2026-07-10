@@ -1,6 +1,8 @@
 # _*_ coding: utf-8 _*_
 import copy
+import re
 import traceback
+from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from urllib.parse import urlencode, quote_plus, urlparse
 
@@ -26,7 +28,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "2.3"
+    plugin_version = "2.4"
     # 插件作者
     plugin_author = "milikii"
     # 作者主页
@@ -39,10 +41,15 @@ class ProwlarrExtend(_PluginBase):
     auth_level = 1
     # 虚拟站点域名，索引器 ID 放在主域中，避免 MoviePilot 将数字子域规范化掉。
     prowlarr_domain_suffix = "extend"
+    _DEFAULT_CRON = "0 0 * * *"
+    _LEGACY_CRONS = {"0 0 */24 * *"}
+    _SEARCH_PAGE_SIZE = 100
 
     def init_plugin(self, config: dict = None):
+        config_changed = False
         self.sites_helper = SitesHelper()
         self._indexers = []
+        self._indexers_authoritative = False
         self._cron = None
         self._enabled = False
         self._proxy = False
@@ -61,7 +68,17 @@ class ProwlarrExtend(_PluginBase):
             self._enabled = config.get("enabled", False)
             self._proxy = config.get("proxy", False)
             self._onlyonce = config.get("onlyonce", False)
-            self._cron = config.get("cron") or "0 0 */24 * *"
+            configured_cron = config.get("cron")
+            self._cron = configured_cron or self._DEFAULT_CRON
+            if configured_cron in self._LEGACY_CRONS:
+                self._cron = self._DEFAULT_CRON
+                config_changed = True
+
+        if config_changed and not self._onlyonce:
+            logger.info(
+                f"【{self.plugin_name}】已将错误的旧更新周期迁移为每天零点：{self._cron}"
+            )
+            self.__update_config()
 
         synced_once = False
         if self._onlyonce:
@@ -162,8 +179,10 @@ class ProwlarrExtend(_PluginBase):
         return ret.json()
 
     def get_indexers(self):
+        self._indexers_authoritative = False
         indexers = self.__get_indexers_from_config()
         if indexers is not None:
+            self._indexers_authoritative = True
             return indexers
         return self.__get_indexers_from_stats()
 
@@ -201,7 +220,11 @@ class ProwlarrExtend(_PluginBase):
                     unsupported += 1
                     continue
 
-                indexers.append(self.__build_indexer(indexer_id, indexer_name))
+                indexers.append(self.__build_indexer(
+                    indexer_id,
+                    indexer_name,
+                    privacy=item.get("privacy"),
+                ))
 
             logger.info(
                 f"【{self.plugin_name}】从 Prowlarr 获取到 {len(indexers)} 个启用索引器，"
@@ -244,14 +267,17 @@ class ProwlarrExtend(_PluginBase):
             logger.error(f"【{self.plugin_name}】获取 indexer 失败：{str(e)}")
             return None
 
-    def __build_indexer(self, indexer_id, indexer_name) -> Dict[str, Any]:
+    def __build_indexer(self, indexer_id, indexer_name, privacy: Optional[str] = None) -> Dict[str, Any]:
+        privacy_value = str(privacy or "").strip().lower()
         return {
             "id": f'{self.plugin_name}-{indexer_id}',
             "name": f'{self.plugin_name}-{indexer_name}',
             "url": f'{self._host}/api/v1/indexer/{indexer_id}',
             "domain": self.__build_domain(indexer_id),
-            "public": True,
+            "public": privacy_value == "public",
+            "privacy": privacy_value or "unknown",
             "proxy": self._proxy,
+            "result_num": self._SEARCH_PAGE_SIZE,
         }
 
     def search_torrents(self, site: dict, keyword: str, mtype: Optional[MediaType] = None, page: Optional[int] = 0) -> \
@@ -284,8 +310,8 @@ class ProwlarrExtend(_PluginBase):
                          ("query", keyword),
                          ("indexerIds", indexer_id),
                          ("type", "search"),
-                         ("limit", 150),
-                         ("offset", page * 150 if page else 0),
+                         ("limit", self._SEARCH_PAGE_SIZE),
+                         ("offset", page * self._SEARCH_PAGE_SIZE if page else 0),
                      ] + [("categories", cat) for cat in categories]
             query_string = urlencode(params, quote_via=quote_plus)
             api_url = f"{self._host}/api/v1/search?{query_string}"
@@ -305,6 +331,7 @@ class ProwlarrExtend(_PluginBase):
 
             for entry in data:
                 cat_labels = [c.get("name") for c in entry.get("categories", []) if c.get("name")]
+                download_factor, upload_factor = self._volume_factors(entry)
                 torrent = TorrentInfo(
                     title=entry.get("title"),
                     enclosure=entry.get("downloadUrl") or entry.get("magnetUrl"),
@@ -313,13 +340,14 @@ class ProwlarrExtend(_PluginBase):
                     seeders=entry.get("seeders"),
                     peers=entry.get("leechers"),
                     grabs=entry.get("grabs"),
-                    pubdate=entry.get("publishDate"),
+                    pubdate=self._normalize_pubdate(entry.get("publishDate")),
                     page_url=entry.get("infoUrl") or entry.get("guid"),
+                    imdbid=self._normalize_imdb_id(entry.get("imdbId")),
                     site_name=site_name,
                     labels=cat_labels,
                     category=self._infer_category(entry.get("categories", [])),
-                    downloadvolumefactor=1.0,
-                    uploadvolumefactor=1.0,
+                    downloadvolumefactor=download_factor,
+                    uploadvolumefactor=upload_factor,
                 )
                 results.append(torrent)
 
@@ -327,6 +355,66 @@ class ProwlarrExtend(_PluginBase):
             logger.error(f"【{self.plugin_name}】检索错误：{str(e)}\n{traceback.format_exc()}")
 
         return results
+
+    @staticmethod
+    def _normalize_pubdate(value: Any) -> Any:
+        """Convert Prowlarr ISO timestamps to MoviePilot's local naive format."""
+        if not isinstance(value, str) or not value.strip():
+            return value
+        raw_value = value.strip()
+        try:
+            parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone()
+            return parsed.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return raw_value
+
+    @staticmethod
+    def _normalize_imdb_id(value: Any) -> Optional[str]:
+        if value in (None, "", 0, "0"):
+            return None
+        raw_value = str(value).strip()
+        if raw_value.lower().startswith("tt"):
+            return raw_value
+        if raw_value.isdigit():
+            return f"tt{int(raw_value):07d}"
+        return raw_value
+
+    @staticmethod
+    def _volume_factors(entry: Dict[str, Any]) -> Tuple[float, float]:
+        def factor(value: Any) -> Optional[float]:
+            if value is None or isinstance(value, bool):
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        download_factor = factor(entry.get("downloadVolumeFactor"))
+        upload_factor = factor(entry.get("uploadVolumeFactor"))
+        flags = {
+            re.sub(r"[^a-z0-9]", "", str(flag).lower())
+            for flag in (entry.get("indexerFlags") or [])
+        }
+
+        if download_factor is None:
+            if "freeleech" in flags or "neutralleech" in flags:
+                download_factor = 0.0
+            elif "freeleech75" in flags:
+                download_factor = 0.25
+            elif "halfleech" in flags:
+                download_factor = 0.5
+            elif "freeleech25" in flags:
+                download_factor = 0.75
+            else:
+                download_factor = 1.0
+        if upload_factor is None:
+            if "neutralleech" in flags:
+                upload_factor = 0.0
+            else:
+                upload_factor = 2.0 if "doubleupload" in flags else 1.0
+        return download_factor, upload_factor
 
     async def async_search_torrents(self, site: dict, keyword: str, mtype: Optional[MediaType] = None,
                                     page: Optional[int] = 0) -> List[TorrentInfo]:
@@ -489,14 +577,20 @@ class ProwlarrExtend(_PluginBase):
                 removed_site_keys.add(str(legacy_site_id))
                 removed += 1
 
-        for site in self.__get_managed_site_records():
-            domain = getattr(site, "domain", "")
-            site_id = getattr(site, "id", None)
-            if site_id and str(site_id) not in removed_site_keys and domain not in current_domains:
-                Site.delete(None, site_id)
-                removed_site_ids.append(site_id)
-                removed_site_keys.add(str(site_id))
-                removed += 1
+        if self._indexers_authoritative:
+            for site in self.__get_managed_site_records():
+                domain = getattr(site, "domain", "")
+                site_id = getattr(site, "id", None)
+                if site_id and str(site_id) not in removed_site_keys and domain not in current_domains:
+                    Site.delete(None, site_id)
+                    removed_site_ids.append(site_id)
+                    removed_site_keys.add(str(site_id))
+                    removed += 1
+        else:
+            logger.warning(
+                f"【{self.plugin_name}】当前使用 indexerstats 降级快照，"
+                "仅新增或更新站点，不清理缺失站点"
+            )
 
         if created or updated or removed:
             self.eventmanager.send_event(EventType.SiteUpdated, {"plugin_id": self.plugin_name})
@@ -611,8 +705,8 @@ class ProwlarrExtend(_PluginBase):
                                         'props': {
                                             'model': 'cron',
                                             'label': '更新周期',
-                                            'placeholder': '0 0 */24 * *',
-                                            'hint': '索引列表更新周期，支持5位cron表达式，默认每24小时运行一次'
+                                            'placeholder': '0 0 * * *',
+                                            'hint': '索引列表更新周期，支持5位cron表达式，默认每天零点运行一次'
                                         }
                                     }
                                 ]
@@ -686,7 +780,7 @@ class ProwlarrExtend(_PluginBase):
         ], {
             "host": "",
             "api_key": "",
-            "cron": "0 0 */24 * *",
+            "cron": "0 0 * * *",
             "enabled": False,
             "proxy": False,
             "onlyonce": False
