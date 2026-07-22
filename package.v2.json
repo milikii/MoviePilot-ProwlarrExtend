@@ -36,7 +36,7 @@
     "name": "ProwlarrExtend",
     "description": "扩展检索以支持Prowlarr站点资源",
     "labels": "索引器,Prowlarr",
-    "version": "2.10",
+    "version": "2.11",
     "icon": "Prowlarr.png",
     "author": "milikii",
     "level": 1,
@@ -56,7 +56,8 @@
       "v2.7": "修正详情页表头与列不一致；search_torrents 复用统一 headers；版本契约测试与 CI",
       "v2.8": "配置页支持桥接索引器多选；空选桥接全部；catalog 持久化供表单选项；连接/状态 API 回报过滤结果",
       "v2.9": "表单保存时保留 indexer catalog；同步后自动回写多选元数据；详情页增加摘要与索引器 ID 列",
-      "v2.10": "抽取 selection 纯函数模块；补连接成功单测与维护文档"
+      "v2.10": "抽取 selection 纯函数模块；补连接成功单测与维护文档",
+      "v2.11": "搜索超时可配置；区分超时/HTTP 错误/空结果并记录条数与耗时"
     }
   }
 }

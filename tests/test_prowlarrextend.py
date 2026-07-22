@@ -17,6 +17,7 @@ def _plugin(plugin_modules):
     plugin._selected_indexers = []
     plugin._indexer_catalog = []
     plugin._indexers_authoritative = False
+    plugin._search_timeout = 30
     return plugin
 
 
@@ -41,11 +42,19 @@ def test_legacy_cron_is_migrated(plugin_modules):
 def test_search_maps_time_flags_and_uses_real_page_size(plugin_modules, monkeypatch):
     module = plugin_modules.prowlarr
     plugin = _plugin(plugin_modules)
+    plugin._search_timeout = 45
     requested_urls = []
+    request_kwargs = []
 
     class Response:
+        status_code = 200
+
         def __bool__(self):
             return True
+
+        @property
+        def text(self):
+            return "[]"
 
         @staticmethod
         def json():
@@ -60,7 +69,7 @@ def test_search_maps_time_flags_and_uses_real_page_size(plugin_modules, monkeypa
 
     class RequestUtils:
         def __init__(self, *args, **kwargs):
-            pass
+            request_kwargs.append(kwargs)
 
         def get_res(self, url):
             requested_urls.append(url)
@@ -85,6 +94,7 @@ def test_search_maps_time_flags_and_uses_real_page_size(plugin_modules, monkeypa
     query = parse_qs(urlparse(requested_urls[0]).query)
     assert query["limit"] == ["100"]
     assert query["offset"] == ["100"]
+    assert request_kwargs and request_kwargs[0].get("timeout") == 45
     assert len(results) == 1
     result = results[0]
     assert "T" not in result.pubdate and not result.pubdate.endswith("Z")
@@ -189,6 +199,93 @@ def test_managed_site_detection_uses_domain_and_parser(plugin_modules):
     assert plugin._is_managed_site({"parser": "ProwlarrExtend", "name": "x"}) is True
     assert plugin._is_managed_site({"name": "ProwlarrExtend-Foo"}) is True
     assert plugin._is_managed_site({"name": "NormalSite", "domain": "example.com"}) is False
+
+
+def test_search_http_classifies_timeout_and_errors(plugin_modules):
+    search_http = plugin_modules.prowlarr.search_http
+    assert search_http.normalize_search_timeout(None) == 30
+    assert search_http.normalize_search_timeout(1) == 5
+    assert search_http.normalize_search_timeout(999) == 120
+    assert search_http.normalize_search_timeout("45") == 45
+
+    kind, detail = search_http.classify_search_http(None, elapsed_ms=20123, timeout=20)
+    assert kind == "no_response"
+    assert "timeout=20" in detail
+
+    class BadResponse:
+        status_code = 400
+        text = '{"message":"Search failed due to all selected indexers being unavailable"}'
+
+        def json(self):
+            return {"message": "Search failed due to all selected indexers being unavailable"}
+
+    kind, detail = search_http.classify_search_http(BadResponse(), elapsed_ms=40, timeout=30)
+    assert kind == "http_error"
+    assert "HTTP 400" in detail
+    assert "unavailable" in detail
+
+    class EmptyResponse:
+        status_code = 200
+        text = "[]"
+
+        def json(self):
+            return []
+
+    kind, detail = search_http.classify_search_http(EmptyResponse(), elapsed_ms=12, timeout=30)
+    assert kind == "empty"
+
+
+def test_search_http_error_returns_empty_and_logs(plugin_modules, monkeypatch):
+    module = plugin_modules.prowlarr
+    plugin = _plugin(plugin_modules)
+    warnings = []
+    errors = []
+
+    class BadResponse:
+        status_code = 400
+        text = '{"message":"indexer unavailable"}'
+
+        def __bool__(self):
+            return True
+
+        def json(self):
+            return {"message": "indexer unavailable"}
+
+    class RequestUtils:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_res(self, url):
+            return BadResponse()
+
+    monkeypatch.setattr(module, "RequestUtils", RequestUtils)
+    monkeypatch.setattr(module.logger, "error", lambda msg: errors.append(msg))
+    monkeypatch.setattr(module.logger, "warning", lambda msg: warnings.append(msg))
+    monkeypatch.setattr(module.logger, "info", lambda msg: None)
+
+    results = plugin.search_torrents(
+        site={
+            "id": 3,
+            "name": "ProwlarrExtend-BeyondHD",
+            "domain": "prowlarr-3.extend",
+        },
+        keyword="Awake",
+    )
+    assert results == []
+    assert any("HTTP 400" in msg and "unavailable" in msg for msg in errors)
+
+
+def test_search_timeout_survives_form_defaults(plugin_modules):
+    plugin = _plugin(plugin_modules)
+    plugin.init_plugin({
+        "host": "http://prowlarr",
+        "api_key": "secret",
+        "enabled": True,
+        "search_timeout": "60",
+    })
+    assert plugin._search_timeout == 60
+    _form, defaults = plugin.get_form()
+    assert defaults["search_timeout"] == 30
 
 
 def test_connection_requires_config(plugin_modules):

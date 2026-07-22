@@ -1,5 +1,6 @@
 # _*_ coding: utf-8 _*_
 import copy
+import time
 import traceback
 from typing import List, Dict, Any, Tuple, Optional
 from urllib.parse import urlencode, quote_plus, urlparse
@@ -24,6 +25,12 @@ from .mapping import (
     volume_factors,
 )
 from . import selection as selection_mod
+from .search_http import (
+    DEFAULT_SEARCH_TIMEOUT,
+    classify_search_http,
+    normalize_search_timeout,
+    parse_response_payload,
+)
 
 
 class ProwlarrExtend(_PluginBase):
@@ -34,7 +41,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "2.10"
+    plugin_version = "2.11"
     # 插件作者
     plugin_author = "milikii"
     # 作者主页
@@ -64,6 +71,7 @@ class ProwlarrExtend(_PluginBase):
         self._onlyonce = False
         self._selected_indexers: List[str] = []
         self._indexer_catalog: List[Dict[str, str]] = []
+        self._search_timeout = DEFAULT_SEARCH_TIMEOUT
 
         if config:
             self._host = config.get("host", "")
@@ -77,6 +85,12 @@ class ProwlarrExtend(_PluginBase):
             self._proxy = config.get("proxy", False)
             self._onlyonce = config.get("onlyonce", False)
             saved_config = self.get_config() or {}
+            if "search_timeout" in config:
+                self._search_timeout = normalize_search_timeout(config.get("search_timeout"))
+            else:
+                self._search_timeout = normalize_search_timeout(
+                    saved_config.get("search_timeout"), DEFAULT_SEARCH_TIMEOUT
+                )
             if "selected_indexers" in config:
                 self._selected_indexers = self.__normalize_selected_indexers(
                     config.get("selected_indexers")
@@ -178,6 +192,9 @@ class ProwlarrExtend(_PluginBase):
             "api_key": api_key,
             "enabled": self._enabled,
             "proxy": self._proxy,
+            "search_timeout": normalize_search_timeout(
+                getattr(self, "_search_timeout", DEFAULT_SEARCH_TIMEOUT)
+            ),
             "selected_indexers": list(getattr(self, "_selected_indexers", None) or []),
             "indexer_catalog": catalog,
         })
@@ -268,6 +285,9 @@ class ProwlarrExtend(_PluginBase):
             "indexers": len(self._indexers) if isinstance(self._indexers, list) else 0,
             "available": len(self._indexer_catalog or []),
             "selected_indexers": list(self._selected_indexers or []),
+            "search_timeout": normalize_search_timeout(
+                getattr(self, "_search_timeout", DEFAULT_SEARCH_TIMEOUT)
+            ),
             "authoritative": bool(getattr(self, "_indexers_authoritative", False)),
             "indexer_names": [
                 item.get("name") for item in (self._indexers or []) if isinstance(item, dict)
@@ -288,14 +308,20 @@ class ProwlarrExtend(_PluginBase):
             "Accept": "application/json, text/javascript, */*; q=0.01"
         }
 
-    def __request_json(self, api_url: str):
+    def __request_json(self, api_url: str, timeout: Optional[int] = None):
         ret = RequestUtils(
             headers=self.__headers(),
-            proxies=settings.PROXY if self._proxy else None
+            proxies=settings.PROXY if self._proxy else None,
+            timeout=timeout or 15,
         ).get_res(api_url)
         if not ret:
             return None
-        return ret.json()
+        if getattr(ret, "status_code", 200) >= 400:
+            return None
+        try:
+            return ret.json()
+        except Exception:
+            return None
 
     def get_indexers(self):
         self._indexers_authoritative = False
@@ -479,10 +505,17 @@ class ProwlarrExtend(_PluginBase):
             return results
 
         site_name = str(site.get("name") or "").replace(f"{self.plugin_name}-", "", 1)
+        site_label = site.get("name") or site_name or indexer_id
+        search_timeout = normalize_search_timeout(
+            getattr(self, "_search_timeout", DEFAULT_SEARCH_TIMEOUT)
+        )
 
         categories = self.get_cat(mtype)
         try:
-            logger.info(f"【{self.plugin_name}】开始检索 Indexer：{site.get('name')}，关键词：{keyword}")
+            logger.info(
+                f"【{self.plugin_name}】开始检索 Indexer：{site_label}，"
+                f"id={indexer_id}，关键词：{keyword}，timeout={search_timeout}s"
+            )
             params = [
                          ("query", keyword),
                          ("indexerIds", indexer_id),
@@ -493,17 +526,33 @@ class ProwlarrExtend(_PluginBase):
             query_string = urlencode(params, quote_via=quote_plus)
             api_url = f"{self._host}/api/v1/search?{query_string}"
 
+            started = time.monotonic()
             response = RequestUtils(
                 headers=self.__headers(),
-                proxies=settings.PROXY if self._proxy else None
+                proxies=settings.PROXY if self._proxy else None,
+                timeout=search_timeout,
             ).get_res(api_url)
-            if not response:
-                logger.warning(f"【{self.plugin_name}】{site.get('name')} 返回为空")
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+
+            kind, detail = classify_search_http(
+                response, elapsed_ms=elapsed_ms, timeout=search_timeout
+            )
+            if kind == "no_response":
+                logger.warning(f"【{self.plugin_name}】{site_label} {detail}")
+                return results
+            if kind == "http_error":
+                logger.error(f"【{self.plugin_name}】{site_label} {detail}")
+                return results
+            if kind == "bad_json":
+                logger.warning(f"【{self.plugin_name}】{site_label} 返回数据异常：{detail}")
                 return results
 
-            data = response.json()
+            data, _raw = parse_response_payload(response)
             if not isinstance(data, list):
-                logger.warning(f"【{self.plugin_name}】{site.get('name')} 返回数据格式异常")
+                logger.warning(f"【{self.plugin_name}】{site_label} 返回数据格式异常：{detail}")
+                return results
+            if kind == "empty":
+                logger.info(f"【{self.plugin_name}】{site_label} {detail}")
                 return results
 
             site_proxy = site.get("proxy")
@@ -512,6 +561,8 @@ class ProwlarrExtend(_PluginBase):
             site_proxy = bool(site_proxy)
 
             for entry in data:
+                if not isinstance(entry, dict):
+                    continue
                 cat_labels = [c.get("name") for c in entry.get("categories", []) if c.get("name")]
                 download_factor, upload_factor = self._volume_factors(entry)
                 torrent = TorrentInfo(
@@ -538,6 +589,11 @@ class ProwlarrExtend(_PluginBase):
                     uploadvolumefactor=upload_factor,
                 )
                 results.append(torrent)
+
+            logger.info(
+                f"【{self.plugin_name}】{site_label} 检索完成："
+                f"{len(results)} 条，关键词={keyword}，耗时 {elapsed_ms}ms"
+            )
 
         except Exception as e:
             logger.error(f"【{self.plugin_name}】检索错误：{str(e)}\n{traceback.format_exc()}")
@@ -901,6 +957,30 @@ class ProwlarrExtend(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'search_timeout',
+                                            'label': '搜索超时（秒）',
+                                            'type': 'number',
+                                            'placeholder': str(DEFAULT_SEARCH_TIMEOUT),
+                                            'hint': f'单索引器 Prowlarr 搜索超时，默认 {DEFAULT_SEARCH_TIMEOUT}s，范围 5-120'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
                                 },
                                 'content': [
                                     {
@@ -936,7 +1016,8 @@ class ProwlarrExtend(_PluginBase):
                                             'text': (
                                                 '请先在 Prowlarr 中添加索引器并确保可搜索，再填地址和 API Key。'
                                                 '保存后点“立即运行一次”同步；可选“桥接索引器”多选限制只注册部分站点。'
-                                                '连接测试可用插件 API：/api/v1/plugin/ProwlarrExtend/test'
+                                                '维护中的索引器建议在多选里去掉，避免拖慢整轮搜索。'
+                                                '连接测试：/api/v1/plugin/ProwlarrExtend/test'
                                             )
                                         }
                                     }
@@ -953,6 +1034,7 @@ class ProwlarrExtend(_PluginBase):
             "enabled": False,
             "proxy": False,
             "onlyonce": False,
+            "search_timeout": DEFAULT_SEARCH_TIMEOUT,
             "selected_indexers": [],
             "indexer_catalog": [],
         }
