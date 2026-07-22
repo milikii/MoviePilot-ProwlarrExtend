@@ -8,7 +8,6 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from datetime import datetime
 from math import ceil
 from pathlib import Path
@@ -23,92 +22,37 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import EventType, NotificationType
 
-
-@dataclass
-class SubtitleTrack:
-    source: str
-    path: Optional[Path]
-    video_path: Optional[Path]
-    stream_index: Optional[int]
-    codec: str
-    language: str
-    title: str
-    forced: bool
-    default: bool
-    text_based: bool
-    extension: str
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "source": self.source,
-            "path": str(self.path) if self.path else "",
-            "video_path": str(self.video_path) if self.video_path else "",
-            "stream_index": self.stream_index,
-            "codec": self.codec,
-            "language": self.language,
-            "title": self.title,
-            "forced": self.forced,
-            "default": self.default,
-            "text_based": self.text_based,
-            "extension": self.extension,
-        }
-
-
-@dataclass
-class SubtitleCue:
-    index: int
-    start: str
-    end: str
-    text: str
-    line_index: Optional[int] = None
-    ass_fields: Optional[List[str]] = None
-    ass_text_index: Optional[int] = None
+from .codes import FailureCode, Stage, map_error_message
+from . import constants as _C
+from . import eta as eta_mod
+from . import formats as formats_mod
+from . import language as language_mod
+from . import quality as quality_mod
+from .models import SubtitleCue, SubtitleTrack
 
 
 class SubtitleHunter(_PluginBase):
     plugin_name = "SubtitleHunter"
     plugin_desc = "入库后自动检测、提取、翻译并规范化字幕"
     plugin_icon = "subtitle.png"
-    plugin_version = "2.12"
+    plugin_version = "2.13"
     plugin_author = "milikii"
     author_url = "https://github.com/milikii"
     plugin_config_prefix = "subtitle_hunter_"
     plugin_order = 20
     auth_level = 1
 
-    _VIDEO_EXTS = {
-        ".mkv", ".mp4", ".m4v", ".mov", ".avi", ".wmv", ".flv",
-        ".ts", ".m2ts", ".mts", ".webm",
-    }
-    _SUB_EXTS = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup"}
-    _TRANSLATABLE_EXTS = {".srt", ".ass", ".ssa"}
-    _TEXT_CODECS = {
-        "subrip", "srt", "ass", "ssa", "mov_text", "webvtt", "text",
-        "realtext", "microdvd", "mpl2", "sami",
-    }
-    _IMAGE_CODECS = {
-        "hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub",
-    }
-    _CHI_PATTERNS = re.compile(
-        r"((^|[._\-\s\[\]()])"
-        r"(chi|chs|cht|chinese|zh([_-]?(cn|hans|hant|tw|hk))?|zho|cmn)"
-        r"(?=$|[._\-\s\[\]()]))|中文|简体|繁体|简中|繁中|双语|中英",
-        re.IGNORECASE,
-    )
-    _ENG_PATTERNS = re.compile(
-        r"((^|[._\-\s\[\]()])(eng|en|english)(?=$|[._\-\s\[\]()]))|英文|英语",
-        re.IGNORECASE,
-    )
-    _FORCED_PATTERNS = re.compile(
-        r"(^|[._\-\s\[\]()])(forced|foreign|only|signs?)(?=$|[._\-\s\[\]()])|强制|特效",
-        re.IGNORECASE,
-    )
-    _SRT_TIME = re.compile(
-        r"(?P<start>\d{2}:\d{2}:\d{2}[,.]\d{3})\s+-->\s+"
-        r"(?P<end>\d{2}:\d{2}:\d{2}[,.]\d{3})(?P<tail>.*)"
-    )
-    _CACHE_MAX_FILES = 500
-    _CACHE_MAX_AGE_DAYS = 30
+    _VIDEO_EXTS = _C.VIDEO_EXTS
+    _SUB_EXTS = _C.SUB_EXTS
+    _TRANSLATABLE_EXTS = _C.TRANSLATABLE_EXTS
+    _TEXT_CODECS = _C.TEXT_CODECS
+    _IMAGE_CODECS = _C.IMAGE_CODECS
+    _CHI_PATTERNS = _C.CHI_PATTERNS
+    _ENG_PATTERNS = _C.ENG_PATTERNS
+    _FORCED_PATTERNS = _C.FORCED_PATTERNS
+    _SRT_TIME = _C.SRT_TIME
+    _CACHE_MAX_FILES = _C.CACHE_MAX_FILES
+    _CACHE_MAX_AGE_DAYS = _C.CACHE_MAX_AGE_DAYS
 
     def init_plugin(self, config: dict = None):
         config_changed = False
@@ -519,6 +463,30 @@ class SubtitleHunter(_PluginBase):
     def _raise_if_cancelled(self):
         if self._is_cancelled():
             raise self._JobCancelled("任务已取消")
+
+    def _stage_begin(self, stage: Any) -> float:
+        name = stage.value if isinstance(stage, Stage) else str(stage)
+        self._update_run(current_stage=name, message=f"阶段开始：{name}")
+        return time.monotonic()
+
+    def _stage_end(self, stage: Any, started_at: float, **extra):
+        name = stage.value if isinstance(stage, Stage) else str(stage)
+        elapsed = max(time.monotonic() - started_at, 0.0)
+        self._ensure_runtime_status()
+        with self._status_lock:
+            timings = dict(self._runtime.get("stage_timings") or {})
+            timings[name] = round(timings.get(name, 0.0) + elapsed, 3)
+            self._runtime["stage_timings"] = timings
+            self._runtime["current_stage"] = name
+            if extra:
+                self._runtime.update(extra)
+        logger.info(f"【{self.plugin_name}】阶段完成 {name}，耗时 {elapsed:.2f}s")
+        self._save_runtime_state()
+
+    def _record_failure_code(self, message: str, code: Optional[str] = None):
+        failure_code = code or map_error_message(message)
+        self._update_run(failure_code=failure_code)
+        return failure_code
 
     def _ensure_multiple_targets_workflow(
         self,
@@ -1096,29 +1064,10 @@ class SubtitleHunter(_PluginBase):
         source: List[SubtitleCue],
         translated: List[SubtitleCue],
     ) -> Tuple[bool, str]:
-        if len(translated) != len(source):
-            return False, f"字幕条目数不一致（原文 {len(source)}，译文 {len(translated)}）"
-        if [cue.index for cue in translated] != [cue.index for cue in source]:
-            return False, "字幕索引与原文不一致"
-
-        for source_cue, translated_cue in zip(source, translated):
-            if self._plain_subtitle_text(source_cue.text) and not self._plain_subtitle_text(translated_cue.text):
-                return False, f"字幕索引 {source_cue.index} 的译文为空"
-        if not self._has_chinese_cue_coverage(translated):
-            return False, "中文内容覆盖不足，模型可能未完成翻译"
-        return True, ""
+        return quality_mod.validate_translated_cues(source, translated)
 
     def _has_chinese_cue_coverage(self, cues: List[SubtitleCue]) -> bool:
-        meaningful = 0
-        chinese = 0
-        for cue in cues:
-            text = self._plain_subtitle_text(cue.text)
-            if not re.search(r"[A-Za-z\u3400-\u4dbf\u4e00-\u9fff]", text):
-                continue
-            meaningful += 1
-            if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", text):
-                chinese += 1
-        return meaningful > 0 and chinese / meaningful >= 0.5
+        return quality_mod.has_chinese_cue_coverage(cues)
 
     def _translate_cues(
         self,
@@ -1133,65 +1082,69 @@ class SubtitleHunter(_PluginBase):
         if not batches:
             return cues
 
-        ai_glossary = self._generate_ai_glossary(batches, media_context, ai_config) if self._ai_enabled else {}
-        glossary_text = self._build_effective_glossary(ai_glossary)
-        workers = min(max(self._parallel_batches, 1), len(batches))
-        logger.info(
-            f"【{self.plugin_name}】开始翻译：{len(translatable)} 条字幕，"
-            f"{len(batches)} 个批次，并发 {workers}，模式 {self._translation_profile}"
-        )
+        stage_started = self._stage_begin(Stage.TRANSLATE)
+        try:
+            ai_glossary = self._generate_ai_glossary(batches, media_context, ai_config) if self._ai_enabled else {}
+            glossary_text = self._build_effective_glossary(ai_glossary)
+            workers = min(max(self._parallel_batches, 1), len(batches))
+            logger.info(
+                f"【{self.plugin_name}】开始翻译：{len(translatable)} 条字幕，"
+                f"{len(batches)} 个批次，并发 {workers}，模式 {self._translation_profile}"
+            )
 
-        completed = 0
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="SubtitleHunterTranslate") as executor:
-            futures = {
-                executor.submit(
-                    self._translate_batch,
-                    batch_no,
-                    len(batches),
-                    batch,
-                    media_context,
-                    ai_config,
-                    glossary_text,
-                ): (batch_no, batch)
-                for batch_no, batch in enumerate(batches, start=1)
-            }
-            try:
-                for future in as_completed(futures):
-                    self._raise_if_cancelled()
-                    batch_no, batch = futures[future]
-                    result = future.result()
-                    for cue in batch:
-                        translated_by_index[cue.index] = result.get(cue.index) or cue.text
-                    completed += 1
-                    self._update_run(
-                        message=f"翻译批次完成：{completed}/{len(batches)}",
-                        translation_batches_total=len(batches),
-                        translation_batches_done=completed,
-                    )
-                    logger.info(
-                        f"【{self.plugin_name}】翻译批次完成 {completed}/{len(batches)}："
-                        f"batch {batch_no}"
-                    )
-            except Exception:
-                for future in futures:
-                    future.cancel()
-                raise
+            completed = 0
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="SubtitleHunterTranslate") as executor:
+                futures = {
+                    executor.submit(
+                        self._translate_batch,
+                        batch_no,
+                        len(batches),
+                        batch,
+                        media_context,
+                        ai_config,
+                        glossary_text,
+                    ): (batch_no, batch)
+                    for batch_no, batch in enumerate(batches, start=1)
+                }
+                try:
+                    for future in as_completed(futures):
+                        self._raise_if_cancelled()
+                        batch_no, batch = futures[future]
+                        result = future.result()
+                        for cue in batch:
+                            translated_by_index[cue.index] = result.get(cue.index) or cue.text
+                        completed += 1
+                        self._update_run(
+                            message=f"翻译批次完成：{completed}/{len(batches)}",
+                            translation_batches_total=len(batches),
+                            translation_batches_done=completed,
+                        )
+                        logger.info(
+                            f"【{self.plugin_name}】翻译批次完成 {completed}/{len(batches)}："
+                            f"batch {batch_no}"
+                        )
+                except Exception:
+                    for future in futures:
+                        future.cancel()
+                    raise
 
-        output = []
-        for cue in cues:
-            if cue.index in translated_by_index:
-                output.append(SubtitleCue(
-                    index=cue.index,
-                    start=cue.start,
-                    end=cue.end,
-                    text=translated_by_index[cue.index],
-                    line_index=cue.line_index,
-                    ass_fields=list(cue.ass_fields) if cue.ass_fields else None,
-                    ass_text_index=cue.ass_text_index,
-                ))
-            else:
-                output.append(cue)
-        return self._validate_line_length(output, media_context, ai_config, glossary_text)
+            output = []
+            for cue in cues:
+                if cue.index in translated_by_index:
+                    output.append(SubtitleCue(
+                        index=cue.index,
+                        start=cue.start,
+                        end=cue.end,
+                        text=translated_by_index[cue.index],
+                        line_index=cue.line_index,
+                        ass_fields=list(cue.ass_fields) if cue.ass_fields else None,
+                        ass_text_index=cue.ass_text_index,
+                    ))
+                else:
+                    output.append(cue)
+            return self._validate_line_length(output, media_context, ai_config, glossary_text)
+        finally:
+            self._stage_end(Stage.TRANSLATE, stage_started)
 
     def _translate_batch(
         self,
@@ -1520,13 +1473,7 @@ class SubtitleHunter(_PluginBase):
             raise RuntimeError(f"AI API 返回格式不兼容：{payload}") from e
 
     def _parse_translation_response(self, content: str) -> Dict[int, str]:
-        data = json.loads(self._extract_json_array(content))
-        result = {}
-        for item in data:
-            index = int(item.get("index"))
-            value = str(item.get("text") or "").strip()
-            result[index] = value
-        return result
+        return quality_mod.parse_translation_response(content)
 
     def _chunk_cues(self, cues: List[SubtitleCue]) -> List[List[SubtitleCue]]:
         chunks = []
@@ -1665,15 +1612,7 @@ class SubtitleHunter(_PluginBase):
         raise RuntimeError(f"术语抽取失败，已重试 {self._api_retries} 次：{last_error}")
 
     def _parse_glossary_response(self, content: str) -> Dict[str, str]:
-        """Parse a glossary_gen JSON array into a term-to-translation mapping."""
-        data = json.loads(self._extract_json_array(content))
-        result: Dict[str, str] = {}
-        for item in data:
-            term = str(item.get("term") or "").strip()
-            translation = str(item.get("translation") or "").strip()
-            if term and translation:
-                result[term] = translation
-        return result
+        return quality_mod.parse_glossary_response(content)
 
     def _load_glossary_cache(self, cache_key: str) -> Optional[Dict[str, str]]:
         """Load cached glossary_gen output from the existing translation cache directory."""
@@ -1921,117 +1860,29 @@ class SubtitleHunter(_PluginBase):
 
     @staticmethod
     def _extract_json_array(content: str) -> str:
-        """Extract the first JSON array from a model response, allowing fenced JSON."""
-        text = (content or "").strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
-            text = re.sub(r"```$", "", text).strip()
-        start = text.find("[")
-        end = text.rfind("]")
-        if start >= 0 and end > start:
-            return text[start:end + 1]
-        return text
+        return formats_mod.extract_json_array(content)
 
     @staticmethod
     def _is_sentence_boundary(text: str) -> bool:
-        """Return True when subtitle text ends with a sentence-ending punctuation mark."""
-        cleaned = SubtitleHunter._plain_subtitle_text(text)
-        return bool(re.search(r"(?:\.{3}|[.!?。！？]|…+)[\"'）)\]\}”’]*\s*$", cleaned))
+        return formats_mod.is_sentence_boundary(text)
 
     def _parse_srt(self, content: str) -> List[SubtitleCue]:
-        normalized = content.replace("\r\n", "\n").replace("\r", "\n").strip()
-        if not normalized:
-            return []
-        cues = []
-        for block_no, block in enumerate(re.split(r"\n\s*\n", normalized), start=1):
-            lines = [line for line in block.split("\n") if line.strip()]
-            if not lines:
-                continue
-            index = block_no
-            if lines[0].strip().isdigit():
-                index = int(lines[0].strip())
-                lines = lines[1:]
-            if not lines:
-                continue
-            match = self._SRT_TIME.match(lines[0].strip())
-            if not match:
-                continue
-            cues.append(SubtitleCue(
-                index=index,
-                start=match.group("start").replace(".", ","),
-                end=match.group("end").replace(".", ","),
-                text="\n".join(lines[1:]).strip(),
-            ))
-        return cues
+        return formats_mod.parse_srt(content)
 
     @staticmethod
     def _render_srt(cues: List[SubtitleCue]) -> str:
-        blocks = []
-        for output_index, cue in enumerate(cues, start=1):
-            text = (cue.text or "").strip()
-            blocks.append(f"{output_index}\n{cue.start} --> {cue.end}\n{text}")
-        return "\n\n".join(blocks) + "\n"
+        return formats_mod.render_srt(cues)
 
     def _parse_ass(self, content: str) -> Tuple[List[str], List[SubtitleCue]]:
-        lines = content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-        cues = []
-        in_events = False
-        format_fields: List[str] = []
-        text_index = -1
-        cue_index = 1
-
-        for line_no, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.lower() == "[events]":
-                in_events = True
-                continue
-            if in_events and stripped.startswith("[") and stripped.endswith("]"):
-                in_events = False
-            if not in_events:
-                continue
-            if stripped.lower().startswith("format:"):
-                format_fields = [part.strip().lower() for part in stripped.split(":", 1)[1].split(",")]
-                try:
-                    text_index = format_fields.index("text")
-                except ValueError:
-                    text_index = -1
-                continue
-            if not stripped.lower().startswith("dialogue:") or text_index < 0:
-                continue
-            raw = line.split(":", 1)[1].lstrip()
-            fields = raw.split(",", len(format_fields) - 1)
-            if len(fields) <= text_index:
-                continue
-            start = fields[format_fields.index("start")] if "start" in format_fields else ""
-            end = fields[format_fields.index("end")] if "end" in format_fields else ""
-            cues.append(SubtitleCue(
-                index=cue_index,
-                start=start,
-                end=end,
-                text=fields[text_index].replace("\\N", "\n"),
-                line_index=line_no,
-                ass_fields=fields,
-                ass_text_index=text_index,
-            ))
-            cue_index += 1
-        return lines, cues
+        return formats_mod.parse_ass(content)
 
     @staticmethod
     def _render_ass(lines: List[str], cues: List[SubtitleCue]) -> str:
-        for cue in cues:
-            if cue.line_index is None or cue.ass_fields is None or cue.ass_text_index is None:
-                continue
-            fields = list(cue.ass_fields)
-            fields[cue.ass_text_index] = (cue.text or "").replace("\n", "\\N")
-            lines[cue.line_index] = "Dialogue: " + ",".join(fields)
-        return "\n".join(lines)
+        return formats_mod.render_ass(lines, cues)
 
     @staticmethod
     def _plain_subtitle_text(text: str) -> str:
-        cleaned = re.sub(r"<[^>]+>", "", text or "")
-        cleaned = re.sub(r"\{[^}]*}", "", cleaned)
-        cleaned = cleaned.replace("\\N", "\n")
-        return cleaned.strip()
+        return formats_mod.plain_subtitle_text(text)
 
     def _translated_subtitle_path(self, video_path: Path, source_path: Path) -> Path:
         suffix = source_path.suffix.lower()
@@ -2067,31 +1918,16 @@ class SubtitleHunter(_PluginBase):
         return ".srt"
 
     def _is_chinese_language(self, language: str, title: str = "", path: Optional[Path] = None) -> bool:
-        text = " ".join(filter(None, [language or "", title or "", path.name if path else ""]))
-        return self._normalize_language(language) in {"zh", "zh-Hans", "zh-Hant"} or bool(self._CHI_PATTERNS.search(text))
+        return language_mod.is_chinese_language(language, title, path)
 
     def _is_english_language(self, language: str, title: str = "", path: Optional[Path] = None) -> bool:
-        text = " ".join(filter(None, [language or "", title or "", path.name if path else ""]))
-        return self._normalize_language(language) == "en" or bool(self._ENG_PATTERNS.search(text))
+        return language_mod.is_english_language(language, title, path)
 
     def _language_from_text(self, text: str) -> str:
-        if self._CHI_PATTERNS.search(text or ""):
-            return self._target_language
-        if self._ENG_PATTERNS.search(text or ""):
-            return "en"
-        return ""
+        return language_mod.language_from_text(text, self._target_language)
 
     def _normalize_language(self, value: str) -> str:
-        lang = (value or "").strip().lower().replace("_", "-")
-        if not lang:
-            return ""
-        if lang in {"zh", "chi", "zho", "chs", "cmn", "zh-cn", "zh-hans", "cn", "chinese"}:
-            return "zh-Hans"
-        if lang in {"cht", "zh-tw", "zh-hk", "zh-hant"}:
-            return "zh-Hant"
-        if lang in {"en", "eng", "english"}:
-            return "en"
-        return lang
+        return language_mod.normalize_language(value)
 
     def _build_media_context(self, mediainfo: Optional[MediaInfo], target: Path) -> str:
         fields = []
@@ -2252,6 +2088,9 @@ class SubtitleHunter(_PluginBase):
             "details": [],
             "translation_batches_total": 0,
             "translation_batches_done": 0,
+            "current_stage": "",
+            "stage_timings": {},
+            "failure_code": "",
         }
         self._history = []
 
@@ -2346,6 +2185,9 @@ class SubtitleHunter(_PluginBase):
                 "details": [],
                 "translation_batches_total": 0,
                 "translation_batches_done": 0,
+                "current_stage": "",
+                "stage_timings": {},
+                "failure_code": "",
             })
         return started_at
 
@@ -2355,6 +2197,13 @@ class SubtitleHunter(_PluginBase):
             self._runtime.update(kwargs)
 
     def _finish_run(self, status: str, message: str, started_at: float, error: str = "", **kwargs):
+        failure_code = kwargs.pop("failure_code", None)
+        if status in {"失败", "部分失败", "已取消"} and not failure_code:
+            failure_code = map_error_message(error or message)
+        if failure_code:
+            kwargs["failure_code"] = failure_code
+        elif status in {"完成"}:
+            kwargs.setdefault("failure_code", FailureCode.OK.value)
         self._ensure_runtime_status()
         duration = max(time.monotonic() - started_at, 0)
         with self._status_lock:
@@ -2557,46 +2406,16 @@ class SubtitleHunter(_PluginBase):
         return total
 
     def _estimate_eta_seconds(self, video_count, total_chars) -> int:
-        """Estimate workflow duration from total subtitle chars, profile and concurrency.
-
-        total_chars already covers all scanned subtitles for the job, so do not
-        multiply by video_count again (that overcounted multi-episode libraries).
-        """
-        if video_count <= 0:
-            return 0
-        profile_multiplier = {
-            "fast": 1,
-            "standard": 2,
-            "quality": 3,
-        }.get(self._translation_profile, 3)
-        extra_stages = 1.0
-        # 无字幕字符时，按每个视频一个轻量扫描批次估算
-        if total_chars <= 0:
-            batches = max(video_count, 1)
-            profile_multiplier = 0.2
-            extra_stages = 0.1
-        else:
-            batches = max(ceil(total_chars / max(self._batch_chars, 1)), 1)
-        workers = max(self._parallel_batches, 1)
-        # 每段翻译批次按 45 秒估算（OpenAI 兼容网关生成长 JSON 平均 30-90 秒/批，含重试余量）
-        return int(ceil(batches * (profile_multiplier + extra_stages) * 45 / workers))
+        return eta_mod.estimate_eta_seconds(
+            video_count,
+            total_chars,
+            translation_profile=self._translation_profile,
+            batch_chars=self._batch_chars,
+            parallel_batches=self._parallel_batches,
+        )
 
     def _format_duration(self, seconds: int) -> str:
-        """Format rough ETA seconds as a short Chinese duration string."""
-        if seconds <= 0:
-            return "未知"
-        if seconds < 60:
-            return f"约 {seconds} 秒"
-        if seconds < 3600:
-            return f"约 {ceil(seconds / 60)} 分钟"
-        hours = seconds // 3600
-        minutes = ceil((seconds % 3600) / 60)
-        if minutes == 60:
-            hours += 1
-            minutes = 0
-        if minutes <= 0:
-            return f"约 {hours} 小时"
-        return f"约 {hours} 小时 {minutes} 分钟"
+        return eta_mod.format_duration(seconds)
 
     def _current_config(self, onlyonce: Optional[bool] = None) -> Dict[str, Any]:
         return {

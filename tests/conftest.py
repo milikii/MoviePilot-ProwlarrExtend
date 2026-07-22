@@ -1,4 +1,4 @@
-import importlib.util
+import importlib
 import sys
 import types
 from enum import Enum
@@ -9,6 +9,9 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PLUGINS_V2 = ROOT / "plugins.v2"
+if str(PLUGINS_V2) not in sys.path:
+    sys.path.insert(0, str(PLUGINS_V2))
 
 
 class _Logger:
@@ -147,25 +150,26 @@ def _install_import_stubs():
     _install_module("app.log", logger=_Logger())
 
 
-def _load_module(name, relative_path):
-    sys.modules.pop(name, None)
-    spec = importlib.util.spec_from_file_location(name, ROOT / relative_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
+def _purge_plugin_modules():
+    doomed = [
+        name
+        for name in list(sys.modules)
+        if name == "subtitlehunter"
+        or name.startswith("subtitlehunter.")
+        or name == "prowlarrextend"
+        or name.startswith("prowlarrextend.")
+    ]
+    for name in doomed:
+        sys.modules.pop(name, None)
 
 
 @pytest.fixture(scope="session")
 def plugin_modules():
     _install_import_stubs()
+    _purge_plugin_modules()
+    if str(PLUGINS_V2) not in sys.path:
+        sys.path.insert(0, str(PLUGINS_V2))
     return SimpleNamespace(
-        prowlarr=_load_module(
-            "test_prowlarrextend_plugin",
-            "plugins.v2/prowlarrextend/__init__.py",
-        ),
-        subtitle=_load_module(
-            "test_subtitlehunter_plugin",
-            "plugins.v2/subtitlehunter/__init__.py",
-        ),
+        prowlarr=importlib.import_module("prowlarrextend"),
+        subtitle=importlib.import_module("subtitlehunter"),
     )

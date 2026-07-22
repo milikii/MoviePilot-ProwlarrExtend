@@ -1,0 +1,35 @@
+[
+  {
+    "title": "Sample.Movie.2024.1080p.BluRay.x264",
+    "sortTitle": "sample movie 2024",
+    "size": 1234567890,
+    "seeders": 42,
+    "leechers": 3,
+    "grabs": 100,
+    "publishDate": "2024-05-01T12:34:56Z",
+    "downloadUrl": "https://example.test/dl/1",
+    "magnetUrl": null,
+    "infoUrl": "https://example.test/details/1",
+    "guid": "https://example.test/details/1",
+    "imdbId": 1234567,
+    "categories": [{"id": 2000, "name": "Movies/HD"}],
+    "downloadVolumeFactor": 0,
+    "uploadVolumeFactor": 2,
+    "indexerFlags": ["freeleech", "doubleupload"]
+  },
+  {
+    "title": "Sample.Show.S01E01.720p",
+    "sortTitle": "sample show s01e01",
+    "size": 800000000,
+    "seeders": 10,
+    "leechers": 1,
+    "grabs": 20,
+    "publishDate": "2024-06-01T08:00:00+00:00",
+    "downloadUrl": "https://example.test/dl/2",
+    "infoUrl": "https://example.test/details/2",
+    "guid": "https://example.test/details/2",
+    "imdbId": "tt7654321",
+    "categories": [{"id": 5000, "name": "TV/HD"}],
+    "indexerFlags": ["halfleech"]
+  }
+]
