@@ -200,6 +200,63 @@ def test_connection_requires_config(plugin_modules):
     assert "未配置" in result["message"]
 
 
+def test_connection_success_reports_selection(plugin_modules):
+    plugin = _plugin(plugin_modules)
+    payload = json.loads((FIXTURES / "prowlarr_indexers_sample.json").read_text(encoding="utf-8"))
+    calls = {"n": 0}
+
+    def request_json(url):
+        calls["n"] += 1
+        if url.endswith("/api/v1/system/status"):
+            return {"version": "1.32.0", "appName": "Prowlarr"}
+        if url.endswith("/api/v1/indexer"):
+            return payload
+        return None
+
+    plugin._ProwlarrExtend__request_json = request_json
+    plugin._selected_indexers = ["1", "5"]
+
+    result = plugin.test_connection()
+
+    assert result["success"] is True
+    assert result["version"] == "1.32.0"
+    assert result["indexers"] == 2
+    assert result["available"] >= 2
+    assert result["selected"] == ["1", "5"]
+    assert "多选过滤" in result["message"]
+    assert calls["n"] >= 2
+
+
+def test_selection_module_pure_helpers(plugin_modules):
+    selection = plugin_modules.prowlarr.selection_mod
+    assert selection.normalize_selected_indexers("1,ProwlarrExtend-2，prowlarr-3.extend") == ["1", "2", "3"]
+    assert selection.normalize_indexer_catalog([
+        {"id": "1", "name": "A"},
+        {"id": "x", "name": "bad"},
+        {"id": "1", "name": "dup"},
+    ]) == [{"id": "1", "name": "A"}]
+    catalog = selection.catalog_from_indexers(
+        [{"name": "ProwlarrExtend-Foo", "domain": "prowlarr-9.extend"}],
+        lambda site: "9",
+        "ProwlarrExtend",
+    )
+    assert catalog == [{"id": "9", "name": "Foo"}]
+    assert selection.indexer_select_items(catalog) == [{"title": "Foo (#9)", "value": "9"}]
+    filtered = selection.apply_indexer_selection(
+        [{"id": "a", "domain": "prowlarr-1.extend"}, {"id": "b", "domain": "prowlarr-2.extend"}],
+        ["2"],
+        lambda site: site["domain"].split(".")[0].replace("prowlarr-", ""),
+    )
+    assert len(filtered) == 1
+    assert filtered[0]["id"] == "b"
+
+
+def test_selection_module_empty_selected_keeps_all(plugin_modules):
+    selection = plugin_modules.prowlarr.selection_mod
+    indexers = [{"id": "1"}, {"id": "2"}]
+    assert selection.apply_indexer_selection(indexers, [], lambda s: s["id"]) == indexers
+
+
 def test_indexer_config_filters_disabled_and_non_torrent(plugin_modules):
     plugin = _plugin(plugin_modules)
     payload = json.loads((FIXTURES / "prowlarr_indexers_sample.json").read_text(encoding="utf-8"))

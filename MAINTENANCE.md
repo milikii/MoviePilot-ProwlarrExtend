@@ -17,7 +17,30 @@ MoviePilot 更新频繁（约每周 1-2 个版本）。本插件依赖的内部 
 
 - 主版本号跟随 MoviePilot 大版本（v2.x 对应 MP v2.x）
 - 次版本号表示功能变更
-- package.v2.json 中的 version 字段必须与代码中的 `plugin_version` 一致
+- package.v2.json 中的 version 字段必须与代码中的 `plugin_version` 一致（契约测试强制）
+
+当前发布线（2026-07）：
+
+| 插件 | 版本 | 备注 |
+|------|------|------|
+| ProwlarrExtend | 2.10 | 多选桥接 + selection 模块 + 连接/状态 API |
+| SubtitleHunter | 2.16 | mixin 拆分（media/translate/workflow/runtime/ui） |
+
+## 模块边界（改代码前先看）
+
+**ProwlarrExtend**
+
+- `__init__.py`：插件壳、同步、搜索、表单/详情页
+- `mapping.py`：TorrentInfo 字段映射（纯函数）
+- `selection.py`：索引器多选/catalog 归一化（纯函数）
+
+**SubtitleHunter**
+
+- `__init__.py`：配置壳 + mixin 组合（~240 行）
+- `workflow.py` / `translate_ops.py` / `media_ops.py` / `runtime_ops.py` / `ui.py`
+- `formats.py` / `quality.py` / `eta.py` / `language.py` / `codes.py` / `models.py` / `constants.py`
+
+原则：**先锁行为（测绿），再拆结构**；monkeypatch 仍挂在主类方法名上。
 
 ## 测试方法
 
@@ -25,8 +48,9 @@ MoviePilot 更新频繁（约每周 1-2 个版本）。本插件依赖的内部 
 
 1. **本地/CI 单测**：`python3 -m pytest tests/ -q` + `ruff check plugins.v2/ tests/`（GitHub Actions 见 `.github/workflows/ci.yml`）
 2. **契约测试**：`plugin_version` 必须与 `package.v2.json` 的 version 一致；Prowlarr 字段映射与字幕解析有 fixture/契约用例
-3. **集成测试**：在实际 MoviePilot 容器中加载插件，验证索引器列表同步和搜索功能
-4. **版本升级测试**：MoviePilot 每次升级后，检查插件日志是否有 import 错误或方法签名不匹配
+3. **ProwlarrExtend 手工验证**：配置 host/API Key → 立即运行一次 → 多选部分索引器 → 再同步 → 详情页摘要与搜索范围一致；`GET .../ProwlarrExtend/test` 返回 success
+4. **SubtitleHunter 手工验证**：入库事件或手动路径 → 假/真 LLM → 写出 `*.zh-Hans.ai.srt`；取消任务与状态持久化
+5. **版本升级测试**：MoviePilot 每次升级后，检查插件日志是否有 import 错误或方法签名不匹配
 
 ## 发布流程
 

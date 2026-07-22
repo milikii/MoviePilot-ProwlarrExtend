@@ -23,6 +23,7 @@ from .mapping import (
     normalize_pubdate,
     volume_factors,
 )
+from . import selection as selection_mod
 
 
 class ProwlarrExtend(_PluginBase):
@@ -33,7 +34,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "2.9"
+    plugin_version = "2.10"
     # 插件作者
     plugin_author = "milikii"
     # 作者主页
@@ -391,97 +392,43 @@ class ProwlarrExtend(_PluginBase):
             return None
 
     def __normalize_selected_indexers(self, value: Any) -> List[str]:
-        """Normalize multi-select config into digit indexer id strings."""
-        if value is None or value == "":
-            return []
-        if isinstance(value, str):
-            raw_items = [part.strip() for part in value.replace("，", ",").split(",")]
-        elif isinstance(value, (list, tuple, set)):
-            raw_items = list(value)
-        else:
-            raw_items = [value]
-
-        prefix = f"{self.plugin_name}-"
-        selected: List[str] = []
-        seen = set()
-        for item in raw_items:
-            if item is None:
-                continue
-            text = str(item).strip()
-            if not text:
-                continue
-            if text.startswith(prefix):
-                text = text[len(prefix):]
-            if text.startswith("prowlarr-"):
-                text = text.replace("prowlarr-", "", 1).split(".", 1)[0]
-            if not text.isdigit():
-                continue
-            if text in seen:
-                continue
-            seen.add(text)
-            selected.append(text)
-        return selected
+        return selection_mod.normalize_selected_indexers(value, self.plugin_name)
 
     def __normalize_indexer_catalog(self, value: Any) -> List[Dict[str, str]]:
-        if not isinstance(value, list):
-            return []
-        catalog: List[Dict[str, str]] = []
-        seen = set()
-        for item in value:
-            if not isinstance(item, dict):
-                continue
-            indexer_id = str(item.get("id") or "").strip()
-            name = str(item.get("name") or "").strip()
-            if not indexer_id.isdigit() or not name or indexer_id in seen:
-                continue
-            seen.add(indexer_id)
-            catalog.append({"id": indexer_id, "name": name})
-        return catalog
+        return selection_mod.normalize_indexer_catalog(value)
 
     def __refresh_indexer_catalog(self, indexers: List[Dict[str, Any]]):
-        catalog: List[Dict[str, str]] = []
-        for indexer in indexers or []:
-            indexer_id = self.__get_indexer_id(indexer)
-            if not indexer_id:
-                continue
-            raw_name = str(indexer.get("name") or "")
-            name = raw_name.replace(f"{self.plugin_name}-", "", 1) or raw_name or indexer_id
-            catalog.append({"id": indexer_id, "name": name})
+        catalog = selection_mod.catalog_from_indexers(
+            indexers,
+            self.__get_indexer_id,
+            self.plugin_name,
+        )
         if catalog:
             self._indexer_catalog = catalog
 
     def __apply_indexer_selection(self, indexers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Empty selected_indexers means bridge all eligible indexers."""
-        if not indexers:
-            return []
-        selected = set(getattr(self, "_selected_indexers", None) or [])
-        if not selected:
-            return indexers
-        filtered = [
-            indexer
-            for indexer in indexers
-            if self.__get_indexer_id(indexer) in selected
-        ]
-        if len(filtered) != len(indexers):
+        selected = list(getattr(self, "_selected_indexers", None) or [])
+        filtered = selection_mod.apply_indexer_selection(
+            indexers,
+            selected,
+            self.__get_indexer_id,
+        )
+        if selected and len(filtered) != len(indexers or []):
             logger.info(
-                f"【{self.plugin_name}】按多选过滤索引器：{len(indexers)} → {len(filtered)}"
+                f"【{self.plugin_name}】按多选过滤索引器：{len(indexers or [])} → {len(filtered)}"
             )
         return filtered
 
     def __indexer_select_items(self) -> List[Dict[str, str]]:
         catalog = list(getattr(self, "_indexer_catalog", None) or [])
         if not catalog:
-            for indexer in getattr(self, "_indexers", None) or []:
-                indexer_id = self.__get_indexer_id(indexer)
-                if not indexer_id:
-                    continue
-                raw_name = str(indexer.get("name") or "")
-                name = raw_name.replace(f"{self.plugin_name}-", "", 1) or raw_name or indexer_id
-                catalog.append({"id": indexer_id, "name": name})
-        return [
-            {"title": f"{item['name']} (#{item['id']})", "value": item["id"]}
-            for item in catalog
-        ]
+            catalog = selection_mod.catalog_from_indexers(
+                getattr(self, "_indexers", None) or [],
+                self.__get_indexer_id,
+                self.plugin_name,
+            )
+        return selection_mod.indexer_select_items(catalog)
 
     def __build_indexer(self, indexer_id, indexer_name, privacy: Optional[str] = None) -> Dict[str, Any]:
         privacy_value = str(privacy or "").strip().lower()
