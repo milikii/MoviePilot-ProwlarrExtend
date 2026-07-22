@@ -1,0 +1,50 @@
+[
+  {
+    "id": 1,
+    "name": "EnabledTorrent",
+    "enable": true,
+    "supportsSearch": true,
+    "protocol": "torrent",
+    "privacy": "private"
+  },
+  {
+    "id": 2,
+    "name": "DisabledIndexer",
+    "enable": false,
+    "supportsSearch": true,
+    "protocol": "torrent",
+    "privacy": "private"
+  },
+  {
+    "id": 3,
+    "name": "NoSearch",
+    "enable": true,
+    "supportsSearch": false,
+    "protocol": "torrent",
+    "privacy": "public"
+  },
+  {
+    "id": 4,
+    "name": "UsenetFeed",
+    "enable": true,
+    "supportsSearch": true,
+    "protocol": "usenet",
+    "privacy": "private"
+  },
+  {
+    "id": 5,
+    "name": "PublicTorrent",
+    "enable": true,
+    "supportsSearch": true,
+    "protocol": "torrent",
+    "privacy": "public"
+  },
+  {
+    "id": 6,
+    "definitionName": "NamelessFallback",
+    "enable": true,
+    "supportsSearch": true,
+    "protocol": "torrent",
+    "privacy": "semiPrivate"
+  }
+]

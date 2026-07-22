@@ -251,3 +251,62 @@ def test_api_cancel_without_running_job(plugin_modules, tmp_path):
     result = plugin.api_cancel()
     assert result["success"] is True
     assert "没有运行中" in result["message"]
+
+
+def test_ensure_video_chinese_with_fake_translation(plugin_modules, tmp_path):
+    module = plugin_modules.subtitle
+    plugin = _plugin(plugin_modules, tmp_path)
+    plugin._rename_existing = False
+    plugin._ai_enabled = True
+    video = tmp_path / "movie.mkv"
+    video.touch()
+    english = tmp_path / "movie.en.srt"
+    english.write_text(VALID_ENGLISH_SRT, encoding="utf-8")
+    plugin._probe_embedded_subtitles = lambda _video: []
+    plugin._resolve_ai_config = lambda: ({"model": "test", "source": "custom"}, "")
+    translations = {"Hello world.": "你好，世界。", "How are you?": "你好吗？"}
+
+    def translate_cues(cues, *_args):
+        return [
+            module.SubtitleCue(
+                cue.index,
+                cue.start,
+                cue.end,
+                translations.get(cue.text, f"译:{cue.text}"),
+            )
+            for cue in cues
+        ]
+
+    plugin._translate_cues = translate_cues
+    result = plugin._ensure_video_chinese(video, "Example Movie")
+
+    output = tmp_path / "movie.zh-Hans.ai.srt"
+    assert result["status"] == "已生成中文"
+    assert output.exists()
+    content = output.read_text(encoding="utf-8")
+    assert "你好，世界。" in content
+    assert "你好吗？" in content
+    assert str(output) in result["translated_files"]
+
+
+def test_runtime_state_survives_reload(plugin_modules, tmp_path):
+    plugin = _plugin(plugin_modules, tmp_path)
+    started_at = plugin._start_run("手动", tmp_path / "movie.mkv", "Example")
+    plugin._finish_run("完成", "处理完成", started_at, processed=1, translated=1)
+
+    restored = plugin_modules.subtitle.SubtitleHunter()
+    restored.get_data_path = lambda *args, **kwargs: tmp_path / "data"
+    restored.init_plugin({})
+
+    assert restored._runtime["status"] == "完成"
+    assert restored._runtime["message"] == "处理完成"
+    assert restored._runtime["running"] is False
+    assert restored._history
+    assert restored._history[0]["status"] == "完成"
+    assert restored._history[0]["message"] == "处理完成"
+
+
+def test_split_target_paths_supports_comma_variants(plugin_modules):
+    split = plugin_modules.subtitle.SubtitleHunter._split_target_paths
+    assert split("/a,/b，/c") == ["/a", "/b", "/c"]
+    assert split("  ") == []

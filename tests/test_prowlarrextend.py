@@ -1,6 +1,10 @@
+import json
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def _plugin(plugin_modules):
@@ -191,3 +195,122 @@ def test_connection_requires_config(plugin_modules):
     result = plugin.test_connection()
     assert result["success"] is False
     assert "未配置" in result["message"]
+
+
+def test_indexer_config_filters_disabled_and_non_torrent(plugin_modules):
+    plugin = _plugin(plugin_modules)
+    payload = json.loads((FIXTURES / "prowlarr_indexers_sample.json").read_text(encoding="utf-8"))
+    plugin._ProwlarrExtend__request_json = lambda _url: payload
+
+    indexers = plugin._ProwlarrExtend__get_indexers_from_config()
+    names = {item["name"] for item in indexers}
+
+    assert names == {
+        "ProwlarrExtend-EnabledTorrent",
+        "ProwlarrExtend-PublicTorrent",
+        "ProwlarrExtend-NamelessFallback",
+    }
+    public = {item["name"]: item["public"] for item in indexers}
+    assert public["ProwlarrExtend-PublicTorrent"] is True
+    assert public["ProwlarrExtend-EnabledTorrent"] is False
+    assert plugin.get_indexers() and plugin._indexers_authoritative is True
+
+
+def test_authoritative_snapshot_deletes_missing_managed_sites(plugin_modules, monkeypatch):
+    module = plugin_modules.prowlarr
+    plugin = _plugin(plugin_modules)
+    plugin._indexers = [{
+        "id": "ProwlarrExtend-3",
+        "name": "ProwlarrExtend-current",
+        "domain": "prowlarr-3.extend",
+        "public": False,
+        "url": "http://prowlarr/api/v1/indexer/3",
+    }]
+    plugin._indexers_authoritative = True
+    deleted = []
+
+    current = SimpleNamespace(
+        id=3,
+        name="ProwlarrExtend-current",
+        domain="prowlarr-3.extend",
+        url="https://prowlarr-3.extend/",
+        pri=0,
+        public=0,
+        proxy=0,
+        render=0,
+        timeout=15,
+        is_active=True,
+        update=lambda *_: None,
+    )
+    missing = SimpleNamespace(id=4, domain="prowlarr-4.extend")
+    unrelated = SimpleNamespace(id=99, domain="example.com")
+
+    class Site:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+        def create(self, _db):
+            return None
+
+        @classmethod
+        def get_by_domain(cls, _db, domain):
+            if domain == current.domain:
+                return current
+            return None
+
+        @classmethod
+        def list_order_by_pri(cls, _db):
+            return [current, missing, unrelated]
+
+        @classmethod
+        def delete(cls, _db, site_id):
+            deleted.append(site_id)
+
+    monkeypatch.setattr(module, "Site", Site)
+    site_ids, removed = plugin._ProwlarrExtend__sync_site_records()
+
+    assert site_ids == [3]
+    assert deleted == [4]
+    assert removed == [4]
+
+
+def test_indexer_id_supports_new_and_legacy_domains(plugin_modules):
+    plugin = _plugin(plugin_modules)
+    get_id = plugin._ProwlarrExtend__get_indexer_id
+
+    assert get_id({"domain": "prowlarr-15.extend"}) == "15"
+    assert get_id({"domain": "https://prowlarr-15.extend/"}) == "15"
+    assert get_id({"domain": "15.prowlarr.extend"}) == "15"
+    assert get_id({"id": "ProwlarrExtend-7", "domain": ""}) == "7"
+    assert get_id({"url": "http://prowlarr/api/v1/indexer/9", "domain": ""}) == "9"
+    assert get_id({"domain": "example.com", "id": "x"}) == ""
+
+
+def test_sync_search_sites_preserves_user_sites(plugin_modules):
+    plugin = _plugin(plugin_modules)
+    stored = []
+    plugin.systemconfig = SimpleNamespace(
+        get=lambda _key: ["user-site", 10, "ProwlarrExtend-stale", 3, 4],
+        set=lambda _key, value: stored.append(value),
+    )
+
+    plugin._ProwlarrExtend__sync_search_sites(site_ids=[3, 5], removed_site_ids=[4])
+
+    assert stored == [["user-site", 10, 3, 5]]
+
+
+def test_empty_runtime_config_does_not_wipe_saved_credentials(plugin_modules):
+    plugin = _plugin(plugin_modules)
+    plugin._host = ""
+    plugin._api_key = ""
+    plugin._cron = "0 0 * * *"
+    plugin._enabled = True
+    plugin._proxy = False
+    updates = []
+    plugin.get_config = lambda: {"host": "http://saved", "api_key": "saved-key"}
+    plugin.update_config = updates.append
+
+    plugin._ProwlarrExtend__update_config()
+
+    assert updates[-1]["host"] == "http://saved"
+    assert updates[-1]["api_key"] == "saved-key"
