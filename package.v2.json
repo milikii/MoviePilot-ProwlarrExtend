@@ -3,7 +3,7 @@
     "name": "SubtitleHunter",
     "description": "入库后自动检测、提取、翻译并规范化字幕",
     "labels": "字幕,中文字幕,AI翻译,ffmpeg",
-    "version": "2.15",
+    "version": "2.16",
     "icon": "subtitle.png",
     "author": "milikii",
     "level": 1,
@@ -26,7 +26,8 @@
       "v2.12": "修复多视频 ETA 过估；翻译缓存按数量/时效淘汰；支持任务取消与 AI 连通性测试；多目标任务聚合进度",
       "v2.13": "模块化拆分 models/formats/quality/eta/language；阶段耗时与 failure_code 可观测；契约测试",
       "v2.14": "静态检查修正；plugin_version 与 package.v2.json 契约测试；CI",
-      "v2.15": "拆分 MediaOps/RuntimeOps/UI mixin，主类瘦身至约 1.8k 行"
+      "v2.15": "拆分 MediaOps/RuntimeOps/UI mixin，主类瘦身至约 1.8k 行",
+      "v2.16": "继续拆分 TranslateOps/Workflow mixin，插件壳约 250 行"
     }
   },
   "ProwlarrExtend": {

@@ -169,7 +169,8 @@ def test_translation_retry_is_bounded(plugin_modules, tmp_path, monkeypatch):
         return '[{"index": 1, "text": "后来成功"}]'
 
     plugin._chat_completion = completion
-    monkeypatch.setattr(plugin_modules.subtitle.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(plugin_modules.subtitle.runtime_ops.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(plugin_modules.subtitle.translate_ops.time, "sleep", lambda _delay: None)
     with pytest.raises(RuntimeError, match="失败"):
         plugin._translate_stage(
             stage="direct",
@@ -195,7 +196,8 @@ def test_glossary_retry_is_bounded(plugin_modules, tmp_path, monkeypatch):
         raise RuntimeError("offline")
 
     plugin._chat_completion = completion
-    monkeypatch.setattr(module.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(module.runtime_ops.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(module.translate_ops.time, "sleep", lambda _delay: None)
     cue = module.SubtitleCue(1, "00:00:01,000", "00:00:03,000", "Hello")
 
     with pytest.raises(RuntimeError, match="术语抽取失败"):
