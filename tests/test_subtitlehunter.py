@@ -1,6 +1,5 @@
 import threading
 import time
-from pathlib import Path
 
 import pytest
 
@@ -170,7 +169,7 @@ def test_translation_retry_is_bounded(plugin_modules, tmp_path, monkeypatch):
         return '[{"index": 1, "text": "后来成功"}]'
 
     plugin._chat_completion = completion
-    monkeypatch.setattr(module := plugin_modules.subtitle.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(plugin_modules.subtitle.time, "sleep", lambda _delay: None)
     with pytest.raises(RuntimeError, match="失败"):
         plugin._translate_stage(
             stage="direct",

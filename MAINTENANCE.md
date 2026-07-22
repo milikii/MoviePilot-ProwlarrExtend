@@ -23,9 +23,10 @@ MoviePilot 更新频繁（约每周 1-2 个版本）。本插件依赖的内部 
 
 插件无法脱离 MoviePilot 运行（依赖其内部模块）。测试策略：
 
-1. **集成测试**：在实际 MoviePilot 容器中加载插件，验证索引器列表同步和搜索功能
-2. **Prowlarr API Mock**：对搜索逻辑做单元验证时，mock Prowlarr 的 HTTP 响应
-3. **版本升级测试**：MoviePilot 每次升级后，检查插件日志是否有 import 错误或方法签名不匹配
+1. **本地/CI 单测**：`python3 -m pytest tests/ -q` + `ruff check plugins.v2/ tests/`（GitHub Actions 见 `.github/workflows/ci.yml`）
+2. **契约测试**：`plugin_version` 必须与 `package.v2.json` 的 version 一致；Prowlarr 字段映射与字幕解析有 fixture/契约用例
+3. **集成测试**：在实际 MoviePilot 容器中加载插件，验证索引器列表同步和搜索功能
+4. **版本升级测试**：MoviePilot 每次升级后，检查插件日志是否有 import 错误或方法签名不匹配
 
 ## 发布流程
 

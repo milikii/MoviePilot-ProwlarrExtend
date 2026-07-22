@@ -104,3 +104,24 @@ def test_eta_and_failure_code_contracts(pure_modules):
     assert eta.estimate_eta_seconds(10, 9000, "fast", 9000, 1) == eta.estimate_eta_seconds(1, 9000, "fast", 9000, 1)
     assert codes.map_error_message("任务已取消") == "cancelled"
     assert codes.map_error_message("中文内容覆盖不足，模型可能未完成翻译") == "translate_quality"
+
+
+def test_plugin_versions_match_package_metadata(plugin_modules):
+    package = json.loads((Path(__file__).resolve().parents[1] / "package.v2.json").read_text(encoding="utf-8"))
+    assert plugin_modules.prowlarr.ProwlarrExtend.plugin_version == package["ProwlarrExtend"]["version"]
+    assert plugin_modules.subtitle.SubtitleHunter.plugin_version == package["SubtitleHunter"]["version"]
+
+
+def test_prowlarr_detail_page_headers_match_columns(plugin_modules):
+    plugin = plugin_modules.prowlarr.ProwlarrExtend()
+    plugin._indexers = [{
+        "name": "ProwlarrExtend-Example",
+        "domain": "prowlarr-3.extend",
+        "public": False,
+    }]
+    page = plugin.get_page()
+    table = page[0]["content"][0]["content"][0]
+    headers = [th["text"] for th in table["content"][0]["content"][0]["content"]]
+    cells = [td["text"] for td in table["content"][1]["content"][0]["content"]]
+    assert headers == ["站点名称", "域名", "是否公开"]
+    assert cells == ["ProwlarrExtend-Example", "https://prowlarr-3.extend", "否"]

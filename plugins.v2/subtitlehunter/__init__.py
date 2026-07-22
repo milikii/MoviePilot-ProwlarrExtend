@@ -35,7 +35,7 @@ class SubtitleHunter(_PluginBase):
     plugin_name = "SubtitleHunter"
     plugin_desc = "入库后自动检测、提取、翻译并规范化字幕"
     plugin_icon = "subtitle.png"
-    plugin_version = "2.13"
+    plugin_version = "2.14"
     plugin_author = "milikii"
     author_url = "https://github.com/milikii"
     plugin_config_prefix = "subtitle_hunter_"
@@ -1027,7 +1027,9 @@ class SubtitleHunter(_PluginBase):
                 renderer = self._render_srt
             elif suffix in {".ass", ".ssa"}:
                 lines, cues = self._parse_ass(content)
-                renderer = lambda items: self._render_ass(lines, items)
+
+                def renderer(items, _lines=lines):
+                    return self._render_ass(_lines, items)
             else:
                 return False, f"暂不支持翻译 {suffix} 字幕"
 

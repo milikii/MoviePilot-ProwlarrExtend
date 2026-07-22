@@ -1,8 +1,6 @@
 # _*_ coding: utf-8 _*_
 import copy
-import re
 import traceback
-from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 from urllib.parse import urlencode, quote_plus, urlparse
 
@@ -35,7 +33,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "2.6"
+    plugin_version = "2.7"
     # 插件作者
     plugin_author = "milikii"
     # 作者主页
@@ -389,12 +387,6 @@ class ProwlarrExtend(_PluginBase):
 
         site_name = str(site.get("name") or "").replace(f"{self.plugin_name}-", "", 1)
 
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "User-Agent": settings.USER_AGENT,
-            "X-Api-Key": self._api_key,
-            "Accept": "application/json, text/javascript, */*; q=0.01"
-        }
         categories = self.get_cat(mtype)
         try:
             logger.info(f"【{self.plugin_name}】开始检索 Indexer：{site.get('name')}，关键词：{keyword}")
@@ -409,7 +401,7 @@ class ProwlarrExtend(_PluginBase):
             api_url = f"{self._host}/api/v1/search?{query_string}"
 
             response = RequestUtils(
-                headers=headers,
+                headers=self.__headers(),
                 proxies=settings.PROXY if self._proxy else None
             ).get_res(api_url)
             if not response:
@@ -865,7 +857,7 @@ class ProwlarrExtend(_PluginBase):
                     },
                     {
                         'component': 'td',
-                        'text': site.get("public")
+                        'text': '是' if site.get("public") else '否'
                     }
                 ]
             })
@@ -897,14 +889,14 @@ class ProwlarrExtend(_PluginBase):
                                                         'props': {
                                                             'class': 'text-start ps-4'
                                                         },
-                                                        'text': 'id'
+                                                        'text': '站点名称'
                                                     },
                                                     {
                                                         'component': 'th',
                                                         'props': {
                                                             'class': 'text-start ps-4'
                                                         },
-                                                        'text': '站点名称'
+                                                        'text': '域名'
                                                     },
                                                     {
                                                         'component': 'th',
