@@ -33,7 +33,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "2.7"
+    plugin_version = "2.8"
     # 插件作者
     plugin_author = "milikii"
     # 作者主页
@@ -61,6 +61,8 @@ class ProwlarrExtend(_PluginBase):
         self._host = ""
         self._api_key = ""
         self._onlyonce = False
+        self._selected_indexers: List[str] = []
+        self._indexer_catalog: List[Dict[str, str]] = []
 
         if config:
             self._host = config.get("host", "")
@@ -73,6 +75,12 @@ class ProwlarrExtend(_PluginBase):
             self._enabled = config.get("enabled", False)
             self._proxy = config.get("proxy", False)
             self._onlyonce = config.get("onlyonce", False)
+            self._selected_indexers = self.__normalize_selected_indexers(
+                config.get("selected_indexers")
+            )
+            self._indexer_catalog = self.__normalize_indexer_catalog(
+                config.get("indexer_catalog")
+            )
             configured_cron = config.get("cron")
             self._cron = configured_cron or self._DEFAULT_CRON
             if configured_cron in self._LEGACY_CRONS:
@@ -155,6 +163,8 @@ class ProwlarrExtend(_PluginBase):
             "api_key": api_key,
             "enabled": self._enabled,
             "proxy": self._proxy,
+            "selected_indexers": list(self._selected_indexers or []),
+            "indexer_catalog": list(self._indexer_catalog or []),
         })
 
     def get_api(self) -> List[Dict[str, Any]]:
@@ -193,15 +203,25 @@ class ProwlarrExtend(_PluginBase):
                 }
             indexers = self.get_indexers()
             count = len(indexers) if isinstance(indexers, list) else 0
+            catalog_count = len(self._indexer_catalog or [])
             version = ""
             if isinstance(data, dict):
                 version = str(data.get("version") or data.get("appName") or "")
+            if self._selected_indexers and catalog_count:
+                message = (
+                    f"连接成功，Prowlarr 可用 {catalog_count} 个，"
+                    f"当前桥接 {count} 个（已多选过滤）"
+                )
+            else:
+                message = f"连接成功，可用 Torrent 索引器 {count} 个"
             return {
                 "success": True,
-                "message": f"连接成功，可用 Torrent 索引器 {count} 个",
+                "message": message,
                 "host": self._host,
                 "version": version,
                 "indexers": count,
+                "available": catalog_count,
+                "selected": list(self._selected_indexers or []),
                 "authoritative": bool(self._indexers_authoritative),
             }
         except Exception as e:
@@ -219,6 +239,8 @@ class ProwlarrExtend(_PluginBase):
             "proxy": bool(self._proxy),
             "cron": self._cron or "",
             "indexers": len(self._indexers) if isinstance(self._indexers, list) else 0,
+            "available": len(self._indexer_catalog or []),
+            "selected_indexers": list(self._selected_indexers or []),
             "authoritative": bool(getattr(self, "_indexers_authoritative", False)),
             "indexer_names": [
                 item.get("name") for item in (self._indexers or []) if isinstance(item, dict)
@@ -253,8 +275,11 @@ class ProwlarrExtend(_PluginBase):
         indexers = self.__get_indexers_from_config()
         if indexers is not None:
             self._indexers_authoritative = True
-            return indexers
-        return self.__get_indexers_from_stats()
+            return self.__apply_indexer_selection(indexers)
+        indexers = self.__get_indexers_from_stats()
+        if indexers is None:
+            return None
+        return self.__apply_indexer_selection(indexers)
 
     def __get_indexers_from_config(self):
         indexer_query_url = f"{self._host}/api/v1/indexer"
@@ -296,6 +321,7 @@ class ProwlarrExtend(_PluginBase):
                     privacy=item.get("privacy"),
                 ))
 
+            self.__refresh_indexer_catalog(indexers)
             logger.info(
                 f"【{self.plugin_name}】从 Prowlarr 获取到 {len(indexers)} 个启用索引器，"
                 f"跳过禁用 {disabled} 个、不支持搜索/非 Torrent {unsupported} 个"
@@ -331,11 +357,105 @@ class ProwlarrExtend(_PluginBase):
 
                 indexers.append(self.__build_indexer(indexer_id, indexer_name))
 
+            self.__refresh_indexer_catalog(indexers)
             logger.info(f"【{self.plugin_name}】从 Prowlarr indexerstats 获取到 {len(indexers)} 个索引器")
             return indexers
         except Exception as e:
             logger.error(f"【{self.plugin_name}】获取 indexer 失败：{str(e)}")
             return None
+
+    def __normalize_selected_indexers(self, value: Any) -> List[str]:
+        """Normalize multi-select config into digit indexer id strings."""
+        if value is None or value == "":
+            return []
+        if isinstance(value, str):
+            raw_items = [part.strip() for part in value.replace("，", ",").split(",")]
+        elif isinstance(value, (list, tuple, set)):
+            raw_items = list(value)
+        else:
+            raw_items = [value]
+
+        prefix = f"{self.plugin_name}-"
+        selected: List[str] = []
+        seen = set()
+        for item in raw_items:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if not text:
+                continue
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+            if text.startswith("prowlarr-"):
+                text = text.replace("prowlarr-", "", 1).split(".", 1)[0]
+            if not text.isdigit():
+                continue
+            if text in seen:
+                continue
+            seen.add(text)
+            selected.append(text)
+        return selected
+
+    def __normalize_indexer_catalog(self, value: Any) -> List[Dict[str, str]]:
+        if not isinstance(value, list):
+            return []
+        catalog: List[Dict[str, str]] = []
+        seen = set()
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            indexer_id = str(item.get("id") or "").strip()
+            name = str(item.get("name") or "").strip()
+            if not indexer_id.isdigit() or not name or indexer_id in seen:
+                continue
+            seen.add(indexer_id)
+            catalog.append({"id": indexer_id, "name": name})
+        return catalog
+
+    def __refresh_indexer_catalog(self, indexers: List[Dict[str, Any]]):
+        catalog: List[Dict[str, str]] = []
+        for indexer in indexers or []:
+            indexer_id = self.__get_indexer_id(indexer)
+            if not indexer_id:
+                continue
+            raw_name = str(indexer.get("name") or "")
+            name = raw_name.replace(f"{self.plugin_name}-", "", 1) or raw_name or indexer_id
+            catalog.append({"id": indexer_id, "name": name})
+        if catalog:
+            self._indexer_catalog = catalog
+
+    def __apply_indexer_selection(self, indexers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Empty selected_indexers means bridge all eligible indexers."""
+        if not indexers:
+            return []
+        selected = set(getattr(self, "_selected_indexers", None) or [])
+        if not selected:
+            return indexers
+        filtered = [
+            indexer
+            for indexer in indexers
+            if self.__get_indexer_id(indexer) in selected
+        ]
+        if len(filtered) != len(indexers):
+            logger.info(
+                f"【{self.plugin_name}】按多选过滤索引器：{len(indexers)} → {len(filtered)}"
+            )
+        return filtered
+
+    def __indexer_select_items(self) -> List[Dict[str, str]]:
+        catalog = list(getattr(self, "_indexer_catalog", None) or [])
+        if not catalog:
+            for indexer in getattr(self, "_indexers", None) or []:
+                indexer_id = self.__get_indexer_id(indexer)
+                if not indexer_id:
+                    continue
+                raw_name = str(indexer.get("name") or "")
+                name = raw_name.replace(f"{self.plugin_name}-", "", 1) or raw_name or indexer_id
+                catalog.append({"id": indexer_id, "name": name})
+        return [
+            {"title": f"{item['name']} (#{item['id']})", "value": item["id"]}
+            for item in catalog
+        ]
 
     def __build_indexer(self, indexer_id, indexer_name, privacy: Optional[str] = None) -> Dict[str, Any]:
         privacy_value = str(privacy or "").strip().lower()
@@ -678,6 +798,7 @@ class ProwlarrExtend(_PluginBase):
         )
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        indexer_items = self.__indexer_select_items()
         return [
             {
                 'component': 'VForm',
@@ -810,11 +931,40 @@ class ProwlarrExtend(_PluginBase):
                                 },
                                 'content': [
                                     {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'model': 'selected_indexers',
+                                            'label': '桥接索引器',
+                                            'items': indexer_items,
+                                            'multiple': True,
+                                            'chips': True,
+                                            'clearable': True,
+                                            'hint': '留空表示桥接全部可用索引器；需先“立即运行一次”拉取列表后再多选',
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                },
+                                'content': [
+                                    {
                                         'component': 'VAlert',
                                         'props': {
                                             'type': 'info',
                                             'variant': 'tonal',
-                                            'text': '请先在Prowlarr中添加索引器并确保其正常工作，然后在此配置地址和API Key即可。'
+                                            'text': (
+                                                '请先在 Prowlarr 中添加索引器并确保可搜索，再填地址和 API Key。'
+                                                '保存后点“立即运行一次”同步；可选“桥接索引器”多选限制只注册部分站点。'
+                                                '连接测试可用插件 API：/api/v1/plugin/ProwlarrExtend/test'
+                                            )
                                         }
                                     }
                                 ]
@@ -829,7 +979,9 @@ class ProwlarrExtend(_PluginBase):
             "cron": "0 0 * * *",
             "enabled": False,
             "proxy": False,
-            "onlyonce": False
+            "onlyonce": False,
+            "selected_indexers": [],
+            "indexer_catalog": [],
         }
 
     def _ensure_sites_loaded(self) -> bool:

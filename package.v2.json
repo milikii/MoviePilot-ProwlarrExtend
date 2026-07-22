@@ -34,7 +34,7 @@
     "name": "ProwlarrExtend",
     "description": "扩展检索以支持Prowlarr站点资源",
     "labels": "索引器,Prowlarr",
-    "version": "2.7",
+    "version": "2.8",
     "icon": "Prowlarr.png",
     "author": "milikii",
     "level": 1,
@@ -51,7 +51,8 @@
       "v2.4": "修复默认cron周期和降级同步误删站点；同步索引器隐私属性，补全分页、发布时间、IMDb及促销倍率映射",
       "v2.5": "补全TorrentInfo站点元数据；虚拟索引器标记避免系统蜘蛛空转；增加连接测试/状态API与managed note",
       "v2.6": "抽取 mapping 纯函数模块；契约测试覆盖 Prowlarr 字段映射",
-      "v2.7": "修正详情页表头与列不一致；search_torrents 复用统一 headers；版本契约测试与 CI"
+      "v2.7": "修正详情页表头与列不一致；search_torrents 复用统一 headers；版本契约测试与 CI",
+      "v2.8": "配置页支持桥接索引器多选；空选桥接全部；catalog 持久化供表单选项；连接/状态 API 回报过滤结果"
     }
   }
 }
