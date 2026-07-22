@@ -70,3 +70,43 @@ def parse_glossary_response(content: str) -> Dict[str, str]:
         if term and translation:
             result[term] = translation
     return result
+
+
+def glossary_key(term: str) -> str:
+    """Normalize glossary terms for duplicate detection and user override matching."""
+    return re.sub(r"\s+", " ", term or "").strip().lower()
+
+
+def parse_user_glossary(text: str) -> Dict[str, str]:
+    """Parse free-form user glossary textarea (JSON array or term=translation lines)."""
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+    parsed: Dict[str, str] = {}
+    if raw.startswith("["):
+        try:
+            for item in json.loads(extract_json_array(raw)):
+                if not isinstance(item, dict):
+                    continue
+                term = str(item.get("term") or item.get("source") or "").strip()
+                translation = str(
+                    item.get("translation") or item.get("target") or item.get("text") or ""
+                ).strip()
+                if term and translation:
+                    parsed[term] = translation
+            return parsed
+        except Exception:
+            parsed.clear()
+    for line in raw.splitlines():
+        line = line.strip().strip(",;；")
+        if not line:
+            continue
+        for separator in ["=>", "=", "：", ":"]:
+            if separator in line:
+                term, translation = line.split(separator, 1)
+                term = term.strip()
+                translation = translation.strip()
+                if term and translation:
+                    parsed[term] = translation
+                break
+    return parsed

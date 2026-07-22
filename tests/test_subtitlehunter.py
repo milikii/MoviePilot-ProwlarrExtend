@@ -308,6 +308,56 @@ def test_runtime_state_survives_reload(plugin_modules, tmp_path):
     assert restored._history[0]["message"] == "处理完成"
 
 
+def test_chunk_cues_prefers_sentence_boundary(plugin_modules):
+    module = plugin_modules.subtitle
+    batching = module.batching
+    Cue = module.SubtitleCue
+
+    cues = [
+        Cue(1, "00:00:01,000", "00:00:02,000", "AAAA."),
+        Cue(2, "00:00:02,000", "00:00:03,000", "BBBB"),
+        Cue(3, "00:00:03,000", "00:00:04,000", "CCCC."),
+        Cue(4, "00:00:04,000", "00:00:05,000", "DDDD"),
+    ]
+    # soft char limit near first sentence end; boundary probe should cut at cue 1.
+    chunks = batching.chunk_cues(
+        cues,
+        batch_size=10,
+        batch_chars=8,
+        text_fn=lambda c: c.text,
+        is_sentence_boundary=module.formats.is_sentence_boundary,
+    )
+    flat = [cue.index for chunk in chunks for cue in chunk]
+    assert flat == [1, 2, 3, 4]
+    assert all(len(chunk) <= 2 for chunk in chunks)
+    assert chunks[0][-1].text.endswith(".")
+
+
+def test_line_length_and_glossary_pure_rules(plugin_modules):
+    module = plugin_modules.subtitle
+    linecheck = module.linecheck
+    quality = module.quality
+    Cue = module.SubtitleCue
+
+    long_zh = Cue(1, "00:00:00,000", "00:00:01,000", "这是一条明显超过十六个汉字限制的字幕内容啊")
+    violations = linecheck.line_length_violations(long_zh)
+    assert any("限制 16" in item for item in violations)
+
+    assert linecheck.parse_subtitle_time("00:01:02,500") == 62.5
+    assert abs(linecheck.cue_duration_seconds(
+        Cue(1, "00:00:01,000", "00:00:03,000", "x")
+    ) - 2.0) < 1e-6
+
+    assert quality.glossary_key("  Iron   Man ") == "iron man"
+    assert quality.parse_user_glossary("Tony=托尼\nPepper => 佩珀") == {
+        "Tony": "托尼",
+        "Pepper": "佩珀",
+    }
+    assert quality.parse_user_glossary(
+        '[{"term":"Jarvis","translation":"贾维斯"}]'
+    ) == {"Jarvis": "贾维斯"}
+
+
 def test_split_target_paths_supports_comma_variants(plugin_modules):
     split = plugin_modules.subtitle.SubtitleHunter._split_target_paths
     assert split("/a,/b，/c") == ["/a", "/b", "/c"]

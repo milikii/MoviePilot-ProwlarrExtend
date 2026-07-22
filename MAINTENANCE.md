@@ -24,7 +24,7 @@ MoviePilot 更新频繁（约每周 1-2 个版本）。本插件依赖的内部 
 | 插件 | 版本 | 备注 |
 |------|------|------|
 | ProwlarrExtend | 2.10 | 多选桥接 + selection 模块 + 连接/状态 API |
-| SubtitleHunter | 2.16 | mixin 拆分（media/translate/workflow/runtime/ui） |
+| SubtitleHunter | 2.17 | mixin + batching/linecheck/quality 纯规则 |
 
 ## 模块边界（改代码前先看）
 
@@ -38,7 +38,7 @@ MoviePilot 更新频繁（约每周 1-2 个版本）。本插件依赖的内部 
 
 - `__init__.py`：配置壳 + mixin 组合（~240 行）
 - `workflow.py` / `translate_ops.py` / `media_ops.py` / `runtime_ops.py` / `ui.py`
-- `formats.py` / `quality.py` / `eta.py` / `language.py` / `codes.py` / `models.py` / `constants.py`
+- `formats.py` / `quality.py` / `batching.py` / `linecheck.py` / `eta.py` / `language.py` / `codes.py` / `models.py` / `constants.py`
 
 原则：**先锁行为（测绿），再拆结构**；monkeypatch 仍挂在主类方法名上。
 

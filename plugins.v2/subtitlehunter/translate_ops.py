@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import threading
 import time
 import traceback
@@ -18,7 +17,9 @@ from app.core.config import settings
 from app.log import logger
 
 from .codes import Stage
+from . import batching as batching_mod
 from . import formats as formats_mod
+from . import linecheck as linecheck_mod
 from . import quality as quality_mod
 from .models import SubtitleCue
 
@@ -481,55 +482,13 @@ class TranslateOpsMixin:
         return quality_mod.parse_translation_response(content)
 
     def _chunk_cues(self, cues: List[SubtitleCue]) -> List[List[SubtitleCue]]:
-        chunks = []
-        lookahead = 5
-        total = len(cues)
-        start = 0
-        while start < total:
-            end = start
-            chars = 0
-            soft_count = max(1, int(self._batch_size * 0.9))
-            soft_chars = max(1, int(self._batch_chars * 0.9))
-            while end < total:
-                text_len = len(cues[end].text)
-                if end > start and (end - start >= self._batch_size or chars + text_len > self._batch_chars):
-                    break
-                chars += text_len
-                end += 1
-                if end >= total or end - start >= soft_count or chars >= soft_chars:
-                    break
-
-            if end >= total:
-                chunks.append(cues[start:end])
-                break
-
-            cut = end if self._is_sentence_boundary(cues[end - 1].text) else 0
-            probe_end = end
-            probe_chars = chars
-            while not cut and probe_end < total and probe_end - end < lookahead:
-                text_len = len(cues[probe_end].text)
-                if probe_end - start >= self._batch_size or probe_chars + text_len > self._batch_chars:
-                    break
-                probe_chars += text_len
-                probe_end += 1
-                if self._is_sentence_boundary(cues[probe_end - 1].text):
-                    cut = probe_end
-                    break
-
-            if not cut:
-                hard_end = end
-                hard_chars = chars
-                while hard_end < total:
-                    text_len = len(cues[hard_end].text)
-                    if hard_end - start >= self._batch_size or hard_chars + text_len > self._batch_chars:
-                        break
-                    hard_chars += text_len
-                    hard_end += 1
-                cut = hard_end
-
-            chunks.append(cues[start:cut])
-            start = cut
-        return chunks
+        return batching_mod.chunk_cues(
+            cues,
+            self._batch_size,
+            self._batch_chars,
+            text_fn=lambda cue: cue.text,
+            is_sentence_boundary=self._is_sentence_boundary,
+        )
 
     def _generate_ai_glossary(
         self,
@@ -686,38 +645,12 @@ class TranslateOpsMixin:
 
     def _parse_user_glossary(self) -> Dict[str, str]:
         """Parse the free-form user glossary textarea into term translations."""
-        text = (self._glossary or "").strip()
-        if not text:
-            return {}
-        parsed: Dict[str, str] = {}
-        if text.startswith("["):
-            try:
-                for item in json.loads(self._extract_json_array(text)):
-                    term = str(item.get("term") or item.get("source") or "").strip()
-                    translation = str(item.get("translation") or item.get("target") or item.get("text") or "").strip()
-                    if term and translation:
-                        parsed[term] = translation
-                return parsed
-            except Exception:
-                parsed.clear()
-        for line in text.splitlines():
-            line = line.strip().strip(",;；")
-            if not line:
-                continue
-            for separator in ["=>", "=", "：", ":"]:
-                if separator in line:
-                    term, translation = line.split(separator, 1)
-                    term = term.strip()
-                    translation = translation.strip()
-                    if term and translation:
-                        parsed[term] = translation
-                    break
-        return parsed
+        return quality_mod.parse_user_glossary(self._glossary or "")
 
     @staticmethod
     def _glossary_key(term: str) -> str:
         """Normalize glossary terms for duplicate detection and user override matching."""
-        return re.sub(r"\s+", " ", term or "").strip().lower()
+        return quality_mod.glossary_key(term)
 
     def _glossary_prompt(self, media_context: str, glossary: str) -> str:
         """Build the glossary_gen prompt for extracting reusable subtitle terms."""
@@ -788,28 +721,7 @@ class TranslateOpsMixin:
 
     def _line_length_violations(self, cue: SubtitleCue) -> List[str]:
         """Return Netflix-style line count, line length, and CPS violations for one cue."""
-        text = self._plain_subtitle_text(cue.text)
-        if not text:
-            return []
-        lines = [line.strip() for line in text.replace("\\N", "\n").splitlines() if line.strip()]
-        if not lines:
-            return []
-
-        violations = []
-        chinese_limit = bool(re.search(r"[\u4e00-\u9fff]", text))
-        line_limit = 16 if chinese_limit else 42
-        if len(lines) > 2:
-            violations.append(f"超过两行：{len(lines)} 行")
-        for line_no, line in enumerate(lines, start=1):
-            if len(line) > line_limit:
-                violations.append(f"第 {line_no} 行 {len(line)} 字符，限制 {line_limit}")
-        duration = self._cue_duration_seconds(cue)
-        readable_chars = len(re.sub(r"\s+", "", text))
-        if duration > 0:
-            cps = readable_chars / duration
-            if cps > 15:
-                violations.append(f"CPS {cps:.1f}，限制 15")
-        return violations
+        return linecheck_mod.line_length_violations(cue)
 
     def _compress_line_length_issues(
         self,
@@ -844,24 +756,12 @@ class TranslateOpsMixin:
 
     def _cue_duration_seconds(self, cue: SubtitleCue) -> float:
         """Calculate cue duration in seconds from SRT or ASS timestamp strings."""
-        start = self._parse_subtitle_time(cue.start)
-        end = self._parse_subtitle_time(cue.end)
-        if start is None or end is None:
-            return 0.0
-        return max(end - start, 0.0)
+        return linecheck_mod.cue_duration_seconds(cue)
 
     @staticmethod
     def _parse_subtitle_time(value: str) -> Optional[float]:
         """Parse SRT/ASS timestamps such as 00:01:02,345 or 0:01:02.34."""
-        match = re.match(r"^\s*(\d+):(\d{1,2}):(\d{1,2})(?:[,.](\d+))?\s*$", value or "")
-        if not match:
-            return None
-        hours = int(match.group(1))
-        minutes = int(match.group(2))
-        seconds = int(match.group(3))
-        fraction = match.group(4) or ""
-        fraction_seconds = float(f"0.{fraction}") if fraction else 0.0
-        return hours * 3600 + minutes * 60 + seconds + fraction_seconds
+        return linecheck_mod.parse_subtitle_time(value)
 
     @staticmethod
     def _extract_json_array(content: str) -> str:
