@@ -24,7 +24,7 @@ MoviePilot 更新频繁（约每周 1-2 个版本）。本插件依赖的内部 
 | 插件 | 版本 | 备注 |
 |------|------|------|
 | ProwlarrExtend | 2.10 | 多选桥接 + selection 模块 + 连接/状态 API |
-| SubtitleHunter | 2.17 | mixin + batching/linecheck/quality 纯规则 |
+| SubtitleHunter | 2.18 | mixin 在前、_PluginBase 在后（MRO）；batching/linecheck 纯规则 |
 
 ## 模块边界（改代码前先看）
 

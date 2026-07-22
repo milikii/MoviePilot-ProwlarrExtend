@@ -16,17 +16,19 @@ from .workflow import WorkflowMixin
 
 
 class SubtitleHunter(
-    _PluginBase,
     MediaOpsMixin,
     TranslateOpsMixin,
     WorkflowMixin,
     RuntimeOpsMixin,
     UIMixin,
+    _PluginBase,
 ):
+    # Mixins must precede _PluginBase so concrete get_form/get_page/stop_service
+    # override the abstract stubs (Python MRO left-to-right).
     plugin_name = "SubtitleHunter"
     plugin_desc = "入库后自动检测、提取、翻译并规范化字幕"
     plugin_icon = "subtitle.png"
-    plugin_version = "2.17"
+    plugin_version = "2.18"
     plugin_author = "milikii"
     author_url = "https://github.com/milikii"
     plugin_config_prefix = "subtitle_hunter_"

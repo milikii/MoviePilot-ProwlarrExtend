@@ -3,7 +3,7 @@
     "name": "SubtitleHunter",
     "description": "入库后自动检测、提取、翻译并规范化字幕",
     "labels": "字幕,中文字幕,AI翻译,ffmpeg",
-    "version": "2.17",
+    "version": "2.18",
     "icon": "subtitle.png",
     "author": "milikii",
     "level": 1,
@@ -28,7 +28,8 @@
       "v2.14": "静态检查修正；plugin_version 与 package.v2.json 契约测试；CI",
       "v2.15": "拆分 MediaOps/RuntimeOps/UI mixin，主类瘦身至约 1.8k 行",
       "v2.16": "继续拆分 TranslateOps/Workflow mixin，插件壳约 250 行",
-      "v2.17": "抽取 batching/linecheck 纯模块与术语解析；翻译侧可单测规则下沉"
+      "v2.17": "抽取 batching/linecheck 纯模块与术语解析；翻译侧可单测规则下沉",
+      "v2.18": "修复 mixin 与 _PluginBase 的 MRO：具体 get_form/get_page/stop_service 可覆盖抽象方法"
     }
   },
   "ProwlarrExtend": {

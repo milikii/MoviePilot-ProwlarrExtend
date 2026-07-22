@@ -22,6 +22,17 @@ def _plugin(plugin_modules, tmp_path):
     return plugin
 
 
+def test_mixin_mro_overrides_plugin_base_abstracts(plugin_modules):
+    """Concrete form/page/stop must win over _PluginBase abstract stubs."""
+    cls = plugin_modules.subtitle.SubtitleHunter
+    names = [base.__name__ for base in cls.__mro__]
+    assert names.index("UIMixin") < names.index("_PluginBase")
+    assert names.index("RuntimeOpsMixin") < names.index("_PluginBase")
+    assert "UIMixin" in cls.get_form.__qualname__
+    assert "UIMixin" in cls.get_page.__qualname__
+    assert "RuntimeOpsMixin" in cls.stop_service.__qualname__
+
+
 def test_background_job_admission_is_atomic(plugin_modules, tmp_path):
     plugin = _plugin(plugin_modules, tmp_path)
     started = []
