@@ -118,10 +118,18 @@ def test_prowlarr_detail_page_headers_match_columns(plugin_modules):
         "name": "ProwlarrExtend-Example",
         "domain": "prowlarr-3.extend",
         "public": False,
+        "id": "ProwlarrExtend-3",
+        "url": "http://prowlarr/api/v1/indexer/3",
     }]
+    plugin._selected_indexers = []
+    plugin._indexer_catalog = [{"id": "3", "name": "Example"}]
     page = plugin.get_page()
-    table = page[0]["content"][0]["content"][0]
+    # page[0] summary alert, page[1] table
+    alert = page[0]["content"][0]["content"][0]
+    assert alert["component"] == "VAlert"
+    assert "已桥接 1 个" in alert["props"]["text"]
+    table = page[1]["content"][0]["content"][0]
     headers = [th["text"] for th in table["content"][0]["content"][0]["content"]]
     cells = [td["text"] for td in table["content"][1]["content"][0]["content"]]
-    assert headers == ["站点名称", "域名", "是否公开"]
-    assert cells == ["ProwlarrExtend-Example", "https://prowlarr-3.extend", "否"]
+    assert headers == ["站点名称", "域名", "是否公开", "索引器 ID"]
+    assert cells == ["ProwlarrExtend-Example", "https://prowlarr-3.extend", "否", "3"]

@@ -33,7 +33,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "2.8"
+    plugin_version = "2.9"
     # 插件作者
     plugin_author = "milikii"
     # 作者主页
@@ -75,11 +75,20 @@ class ProwlarrExtend(_PluginBase):
             self._enabled = config.get("enabled", False)
             self._proxy = config.get("proxy", False)
             self._onlyonce = config.get("onlyonce", False)
-            self._selected_indexers = self.__normalize_selected_indexers(
-                config.get("selected_indexers")
-            )
+            saved_config = self.get_config() or {}
+            if "selected_indexers" in config:
+                self._selected_indexers = self.__normalize_selected_indexers(
+                    config.get("selected_indexers")
+                )
+            else:
+                self._selected_indexers = self.__normalize_selected_indexers(
+                    saved_config.get("selected_indexers")
+                )
+            # Form saves often omit catalog; keep last non-empty snapshot for multi-select items.
             self._indexer_catalog = self.__normalize_indexer_catalog(
                 config.get("indexer_catalog")
+            ) or self.__normalize_indexer_catalog(
+                saved_config.get("indexer_catalog")
             )
             configured_cron = config.get("cron")
             self._cron = configured_cron or self._DEFAULT_CRON
@@ -131,6 +140,7 @@ class ProwlarrExtend(_PluginBase):
             logger.warning(f"【{self.plugin_name}】本次索引器同步失败，保留 MoviePilot 现有站点")
             return False
         self._indexers = indexers
+        self.__persist_indexer_metadata()
         if not self._enabled:
             return True if isinstance(self._indexers, list) and len(self._indexers) > 0 else False
 
@@ -156,6 +166,10 @@ class ProwlarrExtend(_PluginBase):
         if (not self._host or not self._api_key) and (saved_config.get("host") or saved_config.get("api_key")):
             logger.warning(f"【{self.plugin_name}】当前 Prowlarr 配置为空，保留已保存的 host/api_key，避免覆盖有效配置")
 
+        catalog = list(getattr(self, "_indexer_catalog", None) or [])
+        if not catalog:
+            catalog = self.__normalize_indexer_catalog(saved_config.get("indexer_catalog"))
+
         self.update_config({
             "onlyonce": False,
             "cron": self._cron,
@@ -163,9 +177,21 @@ class ProwlarrExtend(_PluginBase):
             "api_key": api_key,
             "enabled": self._enabled,
             "proxy": self._proxy,
-            "selected_indexers": list(self._selected_indexers or []),
-            "indexer_catalog": list(self._indexer_catalog or []),
+            "selected_indexers": list(getattr(self, "_selected_indexers", None) or []),
+            "indexer_catalog": catalog,
         })
+
+    def __persist_indexer_metadata(self):
+        """Write catalog/selection after sync without requiring onlyonce."""
+        saved = self.get_config() or {}
+        catalog = list(getattr(self, "_indexer_catalog", None) or [])
+        selected = list(getattr(self, "_selected_indexers", None) or [])
+        if (
+            catalog == self.__normalize_indexer_catalog(saved.get("indexer_catalog"))
+            and selected == self.__normalize_selected_indexers(saved.get("selected_indexers"))
+        ):
+            return
+        self.__update_config()
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
@@ -991,11 +1017,23 @@ class ProwlarrExtend(_PluginBase):
         return isinstance(self._indexers, list) and len(self._indexers) > 0
 
     def get_page(self) -> List[dict]:
-        if not self._ensure_sites_loaded():
-            return []
+        loaded = self._ensure_sites_loaded()
+        bridged = list(self._indexers or []) if loaded else []
+        catalog = list(getattr(self, "_indexer_catalog", None) or [])
+        selected = list(getattr(self, "_selected_indexers", None) or [])
+
+        if selected:
+            summary = (
+                f"已桥接 {len(bridged)} 个索引器"
+                f"（多选 {len(selected)} 个 / 目录 {len(catalog)} 个）"
+            )
+        else:
+            summary = f"已桥接 {len(bridged)} 个索引器（未多选，等同全部）"
+        if not bridged:
+            summary += "；当前无可用站点，请检查 Prowlarr 连接或多选配置"
 
         items = []
-        for site in self._indexers:
+        for site in bridged:
             items.append({
                 'component': 'tr',
                 'content': [
@@ -1010,65 +1048,100 @@ class ProwlarrExtend(_PluginBase):
                     {
                         'component': 'td',
                         'text': '是' if site.get("public") else '否'
-                    }
+                    },
+                    {
+                        'component': 'td',
+                        'text': self.__get_indexer_id(site) or "-"
+                    },
                 ]
             })
 
-        return [
+        page: List[dict] = [
             {
                 'component': 'VRow',
                 'content': [
                     {
                         'component': 'VCol',
-                        'props': {
-                            'cols': 12
-                        },
+                        'props': {'cols': 12},
                         'content': [
                             {
-                                'component': 'VTable',
+                                'component': 'VAlert',
                                 'props': {
-                                    'hover': True
-                                },
-                                'content': [
-                                    {
-                                        'component': 'thead',
-                                        'content': [
-                                            {
-                                                'component': 'tr',
-                                                'content': [
-                                                    {
-                                                        'component': 'th',
-                                                        'props': {
-                                                            'class': 'text-start ps-4'
-                                                        },
-                                                        'text': '站点名称'
-                                                    },
-                                                    {
-                                                        'component': 'th',
-                                                        'props': {
-                                                            'class': 'text-start ps-4'
-                                                        },
-                                                        'text': '域名'
-                                                    },
-                                                    {
-                                                        'component': 'th',
-                                                        'props': {
-                                                            'class': 'text-start ps-4'
-                                                        },
-                                                        'text': '是否公开'
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    },
-                                    {
-                                        'component': 'tbody',
-                                        'content': items
-                                    }
-                                ]
+                                    'type': 'info' if bridged else 'warning',
+                                    'variant': 'tonal',
+                                    'text': summary,
+                                }
                             }
                         ]
                     }
                 ]
             }
         ]
+
+        if not bridged:
+            return page
+
+        page.append({
+            'component': 'VRow',
+            'content': [
+                {
+                    'component': 'VCol',
+                    'props': {
+                        'cols': 12
+                    },
+                    'content': [
+                        {
+                            'component': 'VTable',
+                            'props': {
+                                'hover': True
+                            },
+                            'content': [
+                                {
+                                    'component': 'thead',
+                                    'content': [
+                                        {
+                                            'component': 'tr',
+                                            'content': [
+                                                {
+                                                    'component': 'th',
+                                                    'props': {
+                                                        'class': 'text-start ps-4'
+                                                    },
+                                                    'text': '站点名称'
+                                                },
+                                                {
+                                                    'component': 'th',
+                                                    'props': {
+                                                        'class': 'text-start ps-4'
+                                                    },
+                                                    'text': '域名'
+                                                },
+                                                {
+                                                    'component': 'th',
+                                                    'props': {
+                                                        'class': 'text-start ps-4'
+                                                    },
+                                                    'text': '是否公开'
+                                                },
+                                                {
+                                                    'component': 'th',
+                                                    'props': {
+                                                        'class': 'text-start ps-4'
+                                                    },
+                                                    'text': '索引器 ID'
+                                                },
+                                            ]
+                                        }
+                                    ]
+                                },
+                                {
+                                    'component': 'tbody',
+                                    'content': items
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        })
+        return page

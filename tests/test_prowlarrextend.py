@@ -358,6 +358,48 @@ def test_normalize_selected_indexers_accepts_variants(plugin_modules):
     assert normalize(["ProwlarrExtend-3", 3, "x", "7"]) == ["3", "7"]
 
 
+def test_catalog_survives_form_save_without_catalog_field(plugin_modules):
+    plugin = _plugin(plugin_modules)
+    saved = {
+        "host": "http://saved",
+        "api_key": "saved-key",
+        "selected_indexers": ["1"],
+        "indexer_catalog": [{"id": "1", "name": "Alpha"}, {"id": "2", "name": "Beta"}],
+    }
+    plugin.get_config = lambda: saved
+    plugin.sync_indexers = lambda: True
+
+    # Simulate UI save that only posts visible form models.
+    plugin.init_plugin({
+        "host": "http://prowlarr",
+        "api_key": "secret",
+        "enabled": True,
+        "selected_indexers": ["1", "2"],
+    })
+
+    assert plugin._selected_indexers == ["1", "2"]
+    assert plugin._indexer_catalog == [
+        {"id": "1", "name": "Alpha"},
+        {"id": "2", "name": "Beta"},
+    ]
+
+
+def test_persist_indexer_metadata_writes_catalog(plugin_modules):
+    plugin = _plugin(plugin_modules)
+    updates = []
+    plugin.get_config = lambda: {"host": "http://prowlarr", "api_key": "secret"}
+    plugin.update_config = updates.append
+    plugin._indexer_catalog = [{"id": "1", "name": "Alpha"}]
+    plugin._selected_indexers = ["1"]
+    plugin._cron = "0 0 * * *"
+
+    plugin._ProwlarrExtend__persist_indexer_metadata()
+
+    assert updates
+    assert updates[-1]["indexer_catalog"] == [{"id": "1", "name": "Alpha"}]
+    assert updates[-1]["selected_indexers"] == ["1"]
+
+
 def test_form_exposes_indexer_multi_select(plugin_modules):
     plugin = _plugin(plugin_modules)
     plugin._indexer_catalog = [
