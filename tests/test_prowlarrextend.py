@@ -61,7 +61,16 @@ def test_search_maps_time_flags_and_uses_real_page_size(plugin_modules, monkeypa
 
     monkeypatch.setattr(module, "RequestUtils", RequestUtils)
     results = plugin.search_torrents(
-        site={"name": "ProwlarrExtend-Example", "domain": "prowlarr-3.extend"},
+        site={
+            "id": 33,
+            "name": "ProwlarrExtend-Example",
+            "domain": "prowlarr-3.extend",
+            "proxy": True,
+            "pri": 7,
+            "downloader": "qb",
+            "ua": "test-ua",
+            "cookie": "a=b",
+        },
         keyword="movie",
         page=1,
     )
@@ -76,6 +85,13 @@ def test_search_maps_time_flags_and_uses_real_page_size(plugin_modules, monkeypa
     assert result.downloadvolumefactor == 0.0
     assert result.uploadvolumefactor == 2.0
     assert result.imdbid == "tt1234567"
+    assert result.site == 33
+    assert result.site_name == "Example"
+    assert result.site_proxy is True
+    assert result.site_order == 7
+    assert result.site_downloader == "qb"
+    assert result.site_ua == "test-ua"
+    assert result.site_cookie == "a=b"
 
 
 def test_explicit_volume_factors_take_priority(plugin_modules):
@@ -155,3 +171,23 @@ def test_private_indexer_is_not_registered_as_public(plugin_modules):
     plugin = _plugin(plugin_modules)
     indexer = plugin._ProwlarrExtend__build_indexer(3, "Private", privacy="private")
     assert indexer["public"] is False
+    assert indexer["parser"] == "ProwlarrExtend"
+    assert indexer["plugin"] == "ProwlarrExtend"
+    assert indexer["search"]["paths"] == []
+
+
+def test_managed_site_detection_uses_domain_and_parser(plugin_modules):
+    plugin = _plugin(plugin_modules)
+    assert plugin._is_managed_site({"domain": "prowlarr-9.extend", "name": "other"}) is True
+    assert plugin._is_managed_site({"parser": "ProwlarrExtend", "name": "x"}) is True
+    assert plugin._is_managed_site({"name": "ProwlarrExtend-Foo"}) is True
+    assert plugin._is_managed_site({"name": "NormalSite", "domain": "example.com"}) is False
+
+
+def test_connection_requires_config(plugin_modules):
+    plugin = _plugin(plugin_modules)
+    plugin._host = ""
+    plugin._api_key = ""
+    result = plugin.test_connection()
+    assert result["success"] is False
+    assert "未配置" in result["message"]

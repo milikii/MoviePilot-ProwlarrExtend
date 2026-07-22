@@ -203,3 +203,52 @@ def test_glossary_retry_is_bounded(plugin_modules, tmp_path, monkeypatch):
         plugin._run_glossary_stage(1, 1, [cue], "context", {"model": "test"})
 
     assert len(calls) == 1
+
+
+def test_eta_does_not_multiply_total_chars_by_video_count(plugin_modules, tmp_path):
+    plugin = _plugin(plugin_modules, tmp_path)
+    plugin._translation_profile = "fast"
+    plugin._batch_chars = 9000
+    plugin._parallel_batches = 1
+
+    one_video = plugin._estimate_eta_seconds(1, 9000)
+    ten_videos = plugin._estimate_eta_seconds(10, 9000)
+
+    assert one_video > 0
+    assert ten_videos == one_video
+
+
+def test_translation_cache_cleanup_respects_max_files(plugin_modules, tmp_path):
+    plugin = _plugin(plugin_modules, tmp_path)
+    plugin._CACHE_MAX_FILES = 3
+    plugin._CACHE_MAX_AGE_DAYS = 30
+    cache_dir = plugin.get_data_path() / "translation_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for index in range(5):
+        path = cache_dir / f"{index}.json"
+        path.write_text("{}", encoding="utf-8")
+        paths.append(path)
+        time.sleep(0.01)
+
+    plugin._cleanup_translation_cache()
+
+    remaining = sorted(cache_dir.glob("*.json"))
+    assert len(remaining) == 3
+    assert {path.name for path in remaining} == {"2.json", "3.json", "4.json"}
+
+
+def test_cancel_stops_interruptible_sleep(plugin_modules, tmp_path):
+    plugin = _plugin(plugin_modules, tmp_path)
+    plugin._cancel_event = threading.Event()
+    plugin._cancel_event.set()
+
+    with pytest.raises(plugin._JobCancelled):
+        plugin._interruptible_sleep(5)
+
+
+def test_api_cancel_without_running_job(plugin_modules, tmp_path):
+    plugin = _plugin(plugin_modules, tmp_path)
+    result = plugin.api_cancel()
+    assert result["success"] is True
+    assert "没有运行中" in result["message"]

@@ -69,7 +69,7 @@ class SubtitleHunter(_PluginBase):
     plugin_name = "SubtitleHunter"
     plugin_desc = "入库后自动检测、提取、翻译并规范化字幕"
     plugin_icon = "subtitle.png"
-    plugin_version = "2.11"
+    plugin_version = "2.12"
     plugin_author = "milikii"
     author_url = "https://github.com/milikii"
     plugin_config_prefix = "subtitle_hunter_"
@@ -107,6 +107,8 @@ class SubtitleHunter(_PluginBase):
         r"(?P<start>\d{2}:\d{2}:\d{2}[,.]\d{3})\s+-->\s+"
         r"(?P<end>\d{2}:\d{2}:\d{2}[,.]\d{3})(?P<tail>.*)"
     )
+    _CACHE_MAX_FILES = 500
+    _CACHE_MAX_AGE_DAYS = 30
 
     def init_plugin(self, config: dict = None):
         config_changed = False
@@ -214,7 +216,15 @@ class SubtitleHunter(_PluginBase):
         return []
 
     def stop_service(self):
-        pass
+        """Signal any in-flight background job to stop at the next safe checkpoint."""
+        self._ensure_runtime_status()
+        with self._status_lock:
+            cancel_event = getattr(self, "_cancel_event", None)
+            if cancel_event is not None:
+                cancel_event.set()
+            if self._job_active or self._runtime.get("running"):
+                self._runtime["message"] = "正在停止任务…"
+                logger.info(f"【{self.plugin_name}】已请求停止后台字幕任务")
 
     def _scheduled_run(self):
         """Run the configured scheduled subtitle workflow when no job is active."""
@@ -273,6 +283,20 @@ class SubtitleHunter(_PluginBase):
                 "methods": ["POST"],
                 "auth": "apikey",
                 "summary": "提取指定视频的内嵌文本字幕",
+            },
+            {
+                "path": "/test",
+                "endpoint": self.api_test_ai,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "summary": "测试 AI 翻译配置连通性",
+            },
+            {
+                "path": "/cancel",
+                "endpoint": self.api_cancel,
+                "methods": ["POST"],
+                "auth": "apikey",
+                "summary": "请求取消当前字幕任务",
             },
         ]
 
@@ -374,6 +398,47 @@ class SubtitleHunter(_PluginBase):
             "skipped": skipped,
         }
 
+    def api_test_ai(self) -> Dict[str, Any]:
+        """Validate the active LLM config with a tiny chat completion call."""
+        ai_config, ai_error = self._resolve_ai_config()
+        if not ai_config:
+            return {"success": False, "message": ai_error or "AI 翻译不可用"}
+        try:
+            content = self._chat_completion([
+                {"role": "system", "content": "Reply with exactly OK."},
+                {"role": "user", "content": "ping"},
+            ], ai_config)
+            preview = re.sub(r"\s+", " ", str(content or "")).strip()[:120]
+            return {
+                "success": True,
+                "message": "AI 连接成功",
+                "source": ai_config.get("source"),
+                "model": ai_config.get("model"),
+                "base_url": ai_config.get("base_url"),
+                "preview": preview,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"AI 连接失败：{e}",
+                "source": ai_config.get("source"),
+                "model": ai_config.get("model"),
+                "base_url": ai_config.get("base_url"),
+            }
+
+    def api_cancel(self) -> Dict[str, Any]:
+        """Request cooperative cancellation of the active background job."""
+        self._ensure_runtime_status()
+        with self._status_lock:
+            active = bool(self._job_active or self._runtime.get("running"))
+            cancel_event = getattr(self, "_cancel_event", None)
+            if cancel_event is not None:
+                cancel_event.set()
+        if not active:
+            return {"success": True, "message": "当前没有运行中的任务"}
+        self._update_run(message="已请求取消，等待当前步骤结束…")
+        return {"success": True, "message": "已请求取消当前任务"}
+
     def _start_background_job(
         self,
         source: str,
@@ -391,6 +456,7 @@ class SubtitleHunter(_PluginBase):
                 logger.warning(f"【{self.plugin_name}】已有字幕任务正在运行，跳过：{source}")
                 return False
             self._job_active = True
+            self._cancel_event = threading.Event()
 
         if len(targets) > 1:
             title = f"{len(targets)} 个目标"
@@ -418,6 +484,15 @@ class SubtitleHunter(_PluginBase):
     def _run_reserved_job(self, job, args: Tuple[Any, ...]):
         try:
             job(*args)
+        except self._JobCancelled:
+            logger.info(f"【{self.plugin_name}】字幕任务已取消")
+            self._update_run(
+                running=False,
+                status="已取消",
+                message="任务已取消",
+                error="",
+            )
+            self._save_runtime_state()
         except Exception as e:
             error = traceback.format_exc()
             logger.error(f"【{self.plugin_name}】字幕任务启动后异常退出：{e}\n{error}")
@@ -427,10 +502,23 @@ class SubtitleHunter(_PluginBase):
                 message=f"字幕任务异常退出：{e}",
                 error=error,
             )
+            self._save_runtime_state()
         finally:
             self._ensure_runtime_status()
             with self._status_lock:
                 self._job_active = False
+
+    class _JobCancelled(Exception):
+        """Raised when a cooperative cancel checkpoint is hit."""
+
+    def _is_cancelled(self) -> bool:
+        self._ensure_runtime_status()
+        cancel_event = getattr(self, "_cancel_event", None)
+        return bool(cancel_event is not None and cancel_event.is_set())
+
+    def _raise_if_cancelled(self):
+        if self._is_cancelled():
+            raise self._JobCancelled("任务已取消")
 
     def _ensure_multiple_targets_workflow(
         self,
@@ -439,10 +527,62 @@ class SubtitleHunter(_PluginBase):
     ):
         total = len(targets)
         logger.info(f"【{self.plugin_name}】开始多目标字幕任务：{total} 个目标")
-        for index, target in enumerate(targets, start=1):
-            title = self._media_title(None, target)
-            scoped_source = f"{source} {index}/{total}"
-            self._ensure_chinese_workflow(scoped_source, target, title, None)
+        display_name = f"{total} 个目标"
+        started_at = self._start_run(source=source, target=targets[0], display_name=display_name)
+        aggregate = {
+            "processed": 0,
+            "skipped": 0,
+            "extracted": 0,
+            "translated": 0,
+            "renamed": 0,
+            "failed": 0,
+        }
+        details: List[Dict[str, Any]] = []
+        try:
+            for index, target in enumerate(targets, start=1):
+                self._raise_if_cancelled()
+                title = self._media_title(None, target)
+                scoped_source = f"{source} {index}/{total}"
+                self._update_run(
+                    message=f"多目标进度：{index}/{total} · {title}",
+                    media=f"{display_name}（当前 {title}）",
+                    target_path=str(target),
+                )
+                self._ensure_chinese_workflow(
+                    scoped_source,
+                    target,
+                    title,
+                    None,
+                    aggregate_into=aggregate,
+                    aggregate_details=details,
+                    outer_started_at=started_at,
+                )
+            final_status = "完成" if aggregate["failed"] == 0 else "部分失败"
+            if self._is_cancelled():
+                final_status = "已取消"
+            message = (
+                f"多目标处理完成：目标 {total}，视频 {aggregate['processed']}，"
+                f"跳过 {aggregate['skipped']}，提取 {aggregate['extracted']}，"
+                f"翻译 {aggregate['translated']}，重命名 {aggregate['renamed']}，"
+                f"失败 {aggregate['failed']}"
+            )
+            self._finish_run(final_status, message, started_at, details=details[-10:], **aggregate)
+            self._send_notify(
+                final_status,
+                self._build_finish_notify_text(
+                    final_status=final_status,
+                    source=source,
+                    display_name=display_name,
+                    target=targets[0],
+                    summary=aggregate,
+                    details=details,
+                    duration_seconds=max(time.monotonic() - started_at, 0),
+                ),
+            )
+        except self._JobCancelled:
+            message = f"多目标任务已取消：已完成部分 {aggregate['processed']} 个视频"
+            self._finish_run("已取消", message, started_at, details=details[-10:], **aggregate)
+            self._send_notify("已取消", self._build_skip_notify_text(message, source=source))
 
     def _ensure_chinese_workflow(
         self,
@@ -450,13 +590,25 @@ class SubtitleHunter(_PluginBase):
         target: Path,
         display_name: str,
         mediainfo: Optional[MediaInfo],
+        aggregate_into: Optional[Dict[str, int]] = None,
+        aggregate_details: Optional[List[Dict[str, Any]]] = None,
+        outer_started_at: Optional[float] = None,
     ):
-        started_at = self._start_run(source=source, target=target, display_name=display_name)
+        nested = aggregate_into is not None
+        started_at = outer_started_at if nested and outer_started_at is not None else self._start_run(
+            source=source, target=target, display_name=display_name
+        )
+        if nested:
+            self._update_run(source=source, target_path=str(target), media=display_name)
         try:
+            self._raise_if_cancelled()
             if not target.exists():
                 message = f"目标不存在：{target}"
                 logger.error(f"【{self.plugin_name}】{message}")
-                self._finish_run("失败", message, started_at, error=message)
+                if not nested:
+                    self._finish_run("失败", message, started_at, error=message)
+                elif aggregate_into is not None:
+                    aggregate_into["failed"] += 1
                 return
 
             media_context = self._build_media_context(mediainfo, target)
@@ -465,12 +617,13 @@ class SubtitleHunter(_PluginBase):
             if not videos:
                 message = f"未发现视频文件：{target}"
                 logger.warning(f"【{self.plugin_name}】{message}")
-                self._finish_run("已跳过", message, started_at, errors=scan["errors"])
+                if not nested:
+                    self._finish_run("已跳过", message, started_at, errors=scan["errors"])
                 return
 
             self._update_run(
-                videos=len(videos),
-                subtitles=len(scan["subtitles"]),
+                videos=len(videos) if not nested else self._runtime.get("videos", 0) + len(videos),
+                subtitles=len(scan["subtitles"]) if not nested else self._runtime.get("subtitles", 0) + len(scan["subtitles"]),
                 message=f"发现 {len(videos)} 个视频，开始处理字幕",
                 errors=scan["errors"],
             )
@@ -478,16 +631,17 @@ class SubtitleHunter(_PluginBase):
                 len(videos),
                 self._estimate_scan_subtitle_chars(scan["subtitles"]),
             )
-            notify_text = self._build_start_notify_text(
-                source=source,
-                display_name=display_name,
-                target=target,
-                video_count=len(videos),
-                subtitle_count=len(scan["subtitles"]),
-                eta_seconds=eta_seconds,
-                scan_errors=scan["errors"],
-            )
-            self._send_notify("开始处理字幕", notify_text)
+            if not nested:
+                notify_text = self._build_start_notify_text(
+                    source=source,
+                    display_name=display_name,
+                    target=target,
+                    video_count=len(videos),
+                    subtitle_count=len(scan["subtitles"]),
+                    eta_seconds=eta_seconds,
+                    scan_errors=scan["errors"],
+                )
+                self._send_notify("开始处理字幕", notify_text)
 
             summary = {
                 "processed": 0,
@@ -500,6 +654,7 @@ class SubtitleHunter(_PluginBase):
             details = []
 
             for video in videos:
+                self._raise_if_cancelled()
                 detail = self._ensure_video_chinese(video, media_context)
                 details.append(detail)
                 summary["processed"] += 1
@@ -508,17 +663,27 @@ class SubtitleHunter(_PluginBase):
                 summary["translated"] += len(detail.get("translated_files", []))
                 summary["renamed"] += len(detail.get("renamed_files", []))
                 summary["failed"] += 1 if detail["status"] == "失败" else 0
+                progress = dict(summary)
+                if aggregate_into is not None:
+                    for key in aggregate_into:
+                        progress[key] = aggregate_into[key] + summary[key]
                 self._update_run(
-                    processed=summary["processed"],
-                    skipped=summary["skipped"],
-                    extracted=summary["extracted"],
-                    translated=summary["translated"],
-                    renamed=summary["renamed"],
-                    failed=summary["failed"],
+                    processed=progress["processed"],
+                    skipped=progress["skipped"],
+                    extracted=progress["extracted"],
+                    translated=progress["translated"],
+                    renamed=progress["renamed"],
+                    failed=progress["failed"],
                     last_video=str(video),
-                    details=details[-10:],
+                    details=(aggregate_details or details)[-10:] if aggregate_details is not None else details[-10:],
                     message=f"处理中：{summary['processed']}/{len(videos)}",
                 )
+
+            if aggregate_into is not None:
+                for key, value in summary.items():
+                    aggregate_into[key] = aggregate_into.get(key, 0) + value
+            if aggregate_details is not None:
+                aggregate_details.extend(details)
 
             final_status = "完成" if summary["failed"] == 0 else "部分失败"
             message = (
@@ -526,6 +691,9 @@ class SubtitleHunter(_PluginBase):
                 f"提取 {summary['extracted']}，翻译 {summary['translated']}，"
                 f"重命名 {summary['renamed']}，失败 {summary['failed']}"
             )
+            if nested:
+                return
+
             duration_seconds = max(time.monotonic() - started_at, 0)
             notify_text = self._build_finish_notify_text(
                 final_status=final_status,
@@ -539,9 +707,18 @@ class SubtitleHunter(_PluginBase):
             self._finish_run(final_status, message, started_at, details=details, **summary)
             self._send_notify(final_status, notify_text)
 
+        except self._JobCancelled:
+            if nested:
+                raise
+            message = f"{display_name} 字幕处理已取消"
+            self._finish_run("已取消", message, started_at)
+            self._send_notify("已取消", self._build_skip_notify_text(message, source=source))
         except Exception as e:
             message = f"{display_name} 字幕处理失败：{e}"
             logger.error(f"【{self.plugin_name}】{message}\n{traceback.format_exc()}")
+            if nested and aggregate_into is not None:
+                aggregate_into["failed"] = aggregate_into.get("failed", 0) + 1
+                return
             self._finish_run("失败", message, started_at, error=traceback.format_exc())
             self._send_notify(
                 "字幕处理失败",
@@ -980,6 +1157,7 @@ class SubtitleHunter(_PluginBase):
             }
             try:
                 for future in as_completed(futures):
+                    self._raise_if_cancelled()
                     batch_no, batch = futures[future]
                     result = future.result()
                     for cue in batch:
@@ -1151,7 +1329,7 @@ class SubtitleHunter(_PluginBase):
                     f"【{self.plugin_name}】{stage_name}失败，"
                     f"{delay}s 后重试 {attempt + 1}/{self._api_retries}：{e}"
                 )
-                time.sleep(delay)
+                self._interruptible_sleep(delay)
 
         raise RuntimeError(f"{stage_name}失败，已重试 {self._api_retries} 次：{last_error}")
 
@@ -1223,8 +1401,57 @@ class SubtitleHunter(_PluginBase):
             tmp_path = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")
             tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             tmp_path.replace(path)
+            self._cleanup_translation_cache()
         except Exception as e:
             logger.warning(f"【{self.plugin_name}】写入翻译缓存失败：{path}，{e}")
+
+    def _cleanup_translation_cache(self):
+        """Drop oldest translation cache files when count or age exceeds limits."""
+        cache_dir = self.get_data_path() / "translation_cache"
+        if not cache_dir.exists():
+            return
+        try:
+            files = [path for path in cache_dir.glob("*.json") if path.is_file()]
+        except OSError:
+            return
+        if not files:
+            return
+
+        now = time.time()
+        max_age = self._CACHE_MAX_AGE_DAYS * 86400
+        kept = []
+        removed = 0
+        for path in files:
+            try:
+                age = now - path.stat().st_mtime
+                if age > max_age:
+                    path.unlink(missing_ok=True)
+                    removed += 1
+                else:
+                    kept.append(path)
+            except OSError:
+                continue
+
+        if len(kept) > self._CACHE_MAX_FILES:
+            kept.sort(key=lambda item: item.stat().st_mtime if item.exists() else 0)
+            for path in kept[: max(0, len(kept) - self._CACHE_MAX_FILES)]:
+                try:
+                    path.unlink(missing_ok=True)
+                    removed += 1
+                except OSError:
+                    continue
+        if removed:
+            logger.info(f"【{self.plugin_name}】已清理翻译缓存 {removed} 个文件")
+
+    def _interruptible_sleep(self, seconds: float):
+        """Sleep in short slices so cancel requests can stop retries quickly."""
+        deadline = time.monotonic() + max(seconds, 0)
+        while True:
+            self._raise_if_cancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.5, remaining))
 
     def _translation_prompt(self, stage: str, media_context: str, glossary_text: Optional[str] = None) -> str:
         glossary = (self._glossary if glossary_text is None else glossary_text).strip() or "无"
@@ -1363,6 +1590,7 @@ class SubtitleHunter(_PluginBase):
         seen = set()
         logger.info(f"【{self.plugin_name}】开始生成 AI 术语表：{len(batches)} 个批次")
         for batch_no, batch in enumerate(batches, start=1):
+            self._raise_if_cancelled()
             try:
                 terms = self._run_glossary_stage(batch_no, len(batches), batch, media_context, ai_config)
                 for term, translation in terms.items():
@@ -1433,7 +1661,7 @@ class SubtitleHunter(_PluginBase):
                     f"【{self.plugin_name}】术语抽取失败，"
                     f"{delay}s 后重试 {attempt + 1}/{self._api_retries}：{e}"
                 )
-                time.sleep(delay)
+                self._interruptible_sleep(delay)
         raise RuntimeError(f"术语抽取失败，已重试 {self._api_retries} 次：{last_error}")
 
     def _parse_glossary_response(self, content: str) -> Dict[str, str]:
@@ -1487,6 +1715,7 @@ class SubtitleHunter(_PluginBase):
             tmp_path = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")
             tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
             tmp_path.replace(path)
+            self._cleanup_translation_cache()
         except Exception as e:
             logger.warning(f"【{self.plugin_name}】写入术语缓存失败：{path}，{e}")
 
@@ -1998,6 +2227,7 @@ class SubtitleHunter(_PluginBase):
     def _init_runtime_status(self):
         self._status_lock = threading.Lock()
         self._job_active = False
+        self._cancel_event = threading.Event()
         self._runtime = {
             "running": False,
             "status": "未运行",
@@ -2082,8 +2312,11 @@ class SubtitleHunter(_PluginBase):
     def _ensure_runtime_status(self):
         if not hasattr(self, "_status_lock"):
             self._init_runtime_status()
-        elif not hasattr(self, "_job_active"):
+            return
+        if not hasattr(self, "_job_active"):
             self._job_active = False
+        if not hasattr(self, "_cancel_event"):
+            self._cancel_event = threading.Event()
 
     def _start_run(self, source: str, target: Path, display_name: str) -> float:
         self._ensure_runtime_status()
@@ -2324,7 +2557,11 @@ class SubtitleHunter(_PluginBase):
         return total
 
     def _estimate_eta_seconds(self, video_count, total_chars) -> int:
-        """Estimate scheduled workflow duration from subtitle size, profile and concurrency."""
+        """Estimate workflow duration from total subtitle chars, profile and concurrency.
+
+        total_chars already covers all scanned subtitles for the job, so do not
+        multiply by video_count again (that overcounted multi-episode libraries).
+        """
         if video_count <= 0:
             return 0
         profile_multiplier = {
@@ -2333,11 +2570,16 @@ class SubtitleHunter(_PluginBase):
             "quality": 3,
         }.get(self._translation_profile, 3)
         extra_stages = 1.0
-        batches = ceil(max(total_chars, 0) / max(self._batch_chars, 1))
-        batches = max(batches, 1)
+        # 无字幕字符时，按每个视频一个轻量扫描批次估算
+        if total_chars <= 0:
+            batches = max(video_count, 1)
+            profile_multiplier = 0.2
+            extra_stages = 0.1
+        else:
+            batches = max(ceil(total_chars / max(self._batch_chars, 1)), 1)
         workers = max(self._parallel_batches, 1)
         # 每段翻译批次按 45 秒估算（OpenAI 兼容网关生成长 JSON 平均 30-90 秒/批，含重试余量）
-        return int(ceil(batches * (profile_multiplier + extra_stages) * 45 / workers) * video_count)
+        return int(ceil(batches * (profile_multiplier + extra_stages) * 45 / workers))
 
     def _format_duration(self, seconds: int) -> str:
         """Format rough ETA seconds as a short Chinese duration string."""

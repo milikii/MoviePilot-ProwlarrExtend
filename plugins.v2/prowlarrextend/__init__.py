@@ -28,7 +28,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "2.4"
+    plugin_version = "2.5"
     # 插件作者
     plugin_author = "milikii"
     # 作者主页
@@ -153,7 +153,72 @@ class ProwlarrExtend(_PluginBase):
         })
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return []
+        return [
+            {
+                "path": "/test",
+                "endpoint": self.test_connection,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "summary": "测试 Prowlarr 连接",
+            },
+            {
+                "path": "/status",
+                "endpoint": self.api_status,
+                "methods": ["GET"],
+                "auth": "apikey",
+                "summary": "获取 ProwlarrExtend 同步状态",
+            },
+        ]
+
+    def test_connection(self) -> Dict[str, Any]:
+        """Ping Prowlarr and report connectivity plus usable indexer count."""
+        if not self._host or not self._api_key:
+            return {
+                "success": False,
+                "message": "未配置 Prowlarr 地址或 API Key",
+                "host": self._host or "",
+            }
+        try:
+            data = self.__request_json(f"{self._host}/api/v1/system/status")
+            if data is None:
+                return {
+                    "success": False,
+                    "message": "Prowlarr 无响应，请检查地址、API Key 与代理",
+                    "host": self._host,
+                }
+            indexers = self.get_indexers()
+            count = len(indexers) if isinstance(indexers, list) else 0
+            version = ""
+            if isinstance(data, dict):
+                version = str(data.get("version") or data.get("appName") or "")
+            return {
+                "success": True,
+                "message": f"连接成功，可用 Torrent 索引器 {count} 个",
+                "host": self._host,
+                "version": version,
+                "indexers": count,
+                "authoritative": bool(self._indexers_authoritative),
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"连接失败：{e}",
+                "host": self._host,
+            }
+
+    def api_status(self) -> Dict[str, Any]:
+        """Expose lightweight runtime status for the plugin page and external monitors."""
+        return {
+            "enabled": bool(self._enabled),
+            "host": self._host or "",
+            "proxy": bool(self._proxy),
+            "cron": self._cron or "",
+            "indexers": len(self._indexers) if isinstance(self._indexers, list) else 0,
+            "authoritative": bool(getattr(self, "_indexers_authoritative", False)),
+            "indexer_names": [
+                item.get("name") for item in (self._indexers or []) if isinstance(item, dict)
+            ],
+        }
 
     def get_module(self) -> Dict[str, Any]:
         return {
@@ -269,6 +334,8 @@ class ProwlarrExtend(_PluginBase):
 
     def __build_indexer(self, indexer_id, indexer_name, privacy: Optional[str] = None) -> Dict[str, Any]:
         privacy_value = str(privacy or "").strip().lower()
+        # parser/plugin 标记用于识别本插件托管的虚拟索引器；空 search.paths
+        # 让系统蜘蛛尽早放弃，避免对 prowlarr-*.extend 做 DNS/HTTP 重试。
         return {
             "id": f'{self.plugin_name}-{indexer_id}',
             "name": f'{self.plugin_name}-{indexer_name}',
@@ -278,7 +345,25 @@ class ProwlarrExtend(_PluginBase):
             "privacy": privacy_value or "unknown",
             "proxy": self._proxy,
             "result_num": self._SEARCH_PAGE_SIZE,
+            "timeout": 5,
+            "parser": self.plugin_name,
+            "plugin": self.plugin_name,
+            "search": {"paths": []},
+            "browse": {"path": ""},
+            "torrents": {"list": {"selector": ""}, "fields": {}},
         }
+
+    def _is_managed_site(self, site: dict) -> bool:
+        """Return True when the site belongs to this plugin's virtual indexers."""
+        if not site:
+            return False
+        if site.get("plugin") == self.plugin_name or site.get("parser") == self.plugin_name:
+            return True
+        domain = site.get("domain", "")
+        if domain and self.__is_managed_domain(domain):
+            return True
+        name = str(site.get("name") or "")
+        return name.startswith(f"{self.plugin_name}-")
 
     def search_torrents(self, site: dict, keyword: str, mtype: Optional[MediaType] = None, page: Optional[int] = 0) -> \
             List[TorrentInfo]:
@@ -287,7 +372,7 @@ class ProwlarrExtend(_PluginBase):
         if not site or not keyword:
             return results
 
-        if site.get("name", "").split("-")[0] != self.plugin_name:
+        if not self._is_managed_site(site):
             return results
 
         indexer_id = self.__get_indexer_id(site)
@@ -295,7 +380,7 @@ class ProwlarrExtend(_PluginBase):
             logger.warning(f"【{self.plugin_name}】无法提取索引 ID，跳过站点：{site.get('name')}（domain={site.get('domain')}）")
             return results
 
-        site_name = site.get("name", "").replace(f"{self.plugin_name}-", "", 1)
+        site_name = str(site.get("name") or "").replace(f"{self.plugin_name}-", "", 1)
 
         headers = {
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -329,10 +414,22 @@ class ProwlarrExtend(_PluginBase):
                 logger.warning(f"【{self.plugin_name}】{site.get('name')} 返回数据格式异常")
                 return results
 
+            site_proxy = site.get("proxy")
+            if site_proxy is None:
+                site_proxy = self._proxy
+            site_proxy = bool(site_proxy)
+
             for entry in data:
                 cat_labels = [c.get("name") for c in entry.get("categories", []) if c.get("name")]
                 download_factor, upload_factor = self._volume_factors(entry)
                 torrent = TorrentInfo(
+                    site=site.get("id"),
+                    site_name=site_name,
+                    site_cookie=site.get("cookie"),
+                    site_ua=site.get("ua") or settings.USER_AGENT,
+                    site_proxy=site_proxy,
+                    site_order=site.get("pri") or 0,
+                    site_downloader=site.get("downloader"),
                     title=entry.get("title"),
                     enclosure=entry.get("downloadUrl") or entry.get("magnetUrl"),
                     description=entry.get("sortTitle"),
@@ -343,7 +440,6 @@ class ProwlarrExtend(_PluginBase):
                     pubdate=self._normalize_pubdate(entry.get("publishDate")),
                     page_url=entry.get("infoUrl") or entry.get("guid"),
                     imdbid=self._normalize_imdb_id(entry.get("imdbId")),
-                    site_name=site_name,
                     labels=cat_labels,
                     category=self._infer_category(entry.get("categories", [])),
                     downloadvolumefactor=download_factor,
@@ -545,8 +641,13 @@ class ProwlarrExtend(_PluginBase):
                 "public": 1 if indexer.get("public") else 0,
                 "proxy": 1 if self._proxy else 0,
                 "render": 0,
-                "timeout": 15,
+                "timeout": 5,
                 "is_active": True,
+                "note": {
+                    "managed_by": self.plugin_name,
+                    "indexer_id": self.__get_indexer_id(indexer),
+                    "privacy": indexer.get("privacy") or "unknown",
+                },
             }
 
             site = Site.get_by_domain(None, domain)
