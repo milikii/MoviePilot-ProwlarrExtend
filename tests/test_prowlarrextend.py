@@ -587,3 +587,39 @@ def test_form_exposes_indexer_multi_select(plugin_modules):
         {"title": "Alpha (#1)", "value": "1"},
         {"title": "Beta (#2)", "value": "2"},
     ]
+
+
+def test_search_skips_stale_indexer_when_authoritative(plugin_modules):
+    plugin = _plugin(plugin_modules)
+    plugin._indexers = [{
+        "id": "ProwlarrExtend-1",
+        "name": "ProwlarrExtend-Current",
+        "domain": "prowlarr-1.extend",
+    }]
+    plugin._indexers_authoritative = True
+
+    results = plugin.search_torrents(
+        site={
+            "name": "ProwlarrExtend-Old",
+            "domain": "prowlarr-2.extend",
+        },
+        keyword="movie",
+    )
+
+    assert results == []
+
+
+def test_search_skips_all_when_authoritative_snapshot_is_empty(plugin_modules):
+    plugin = _plugin(plugin_modules)
+    plugin._indexers = []
+    plugin._indexers_authoritative = True
+
+    results = plugin.search_torrents(
+        site={
+            "name": "ProwlarrExtend-Old",
+            "domain": "prowlarr-2.extend",
+        },
+        keyword="movie",
+    )
+
+    assert results == []

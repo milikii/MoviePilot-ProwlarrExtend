@@ -3,7 +3,7 @@
     "name": "SubtitleHunter",
     "description": "入库后自动检测、提取、翻译并规范化字幕",
     "labels": "字幕,中文字幕,AI翻译,ffmpeg",
-    "version": "2.18",
+    "version": "2.19",
     "icon": "subtitle.png",
     "author": "milikii",
     "level": 1,
@@ -29,14 +29,15 @@
       "v2.15": "拆分 MediaOps/RuntimeOps/UI mixin，主类瘦身至约 1.8k 行",
       "v2.16": "继续拆分 TranslateOps/Workflow mixin，插件壳约 250 行",
       "v2.17": "抽取 batching/linecheck 纯模块与术语解析；翻译侧可单测规则下沉",
-      "v2.18": "修复 mixin 与 _PluginBase 的 MRO：具体 get_form/get_page/stop_service 可覆盖抽象方法"
+      "v2.18": "修复 mixin 与 _PluginBase 的 MRO：具体 get_form/get_page/stop_service 可覆盖抽象方法",
+      "v2.19": "英文源选择支持无标记外挂字幕并排除 forced；AI 不可用不再提取中间字幕；实现 keep_intermediate 清理；多目标开始通知；无英文源改为跳过；代理禁用修复；指数退避；扫描结果复用避免重复 ffprobe"
     }
   },
   "ProwlarrExtend": {
     "name": "ProwlarrExtend",
     "description": "扩展检索以支持Prowlarr站点资源",
     "labels": "索引器,Prowlarr",
-    "version": "2.11",
+    "version": "2.12",
     "icon": "Prowlarr.png",
     "author": "milikii",
     "level": 1,
@@ -57,7 +58,8 @@
       "v2.8": "配置页支持桥接索引器多选；空选桥接全部；catalog 持久化供表单选项；连接/状态 API 回报过滤结果",
       "v2.9": "表单保存时保留 indexer catalog；同步后自动回写多选元数据；详情页增加摘要与索引器 ID 列",
       "v2.10": "抽取 selection 纯函数模块；补连接成功单测与维护文档",
-      "v2.11": "搜索超时可配置；区分超时/HTTP 错误/空结果并记录条数与耗时"
+      "v2.11": "搜索超时可配置；区分超时/HTTP 错误/空结果并记录条数与耗时",
+      "v2.12": "搜索跳过已不在桥接列表的残留虚拟站点；索引器 catalog 清空时同步清空；SitesHelper 更新比较扩展；初始化/详情页改为后台/非阻塞同步"
     }
   }
 }

@@ -1,5 +1,6 @@
 # _*_ coding: utf-8 _*_
 import copy
+import threading
 import time
 import traceback
 from typing import List, Dict, Any, Tuple, Optional
@@ -41,7 +42,7 @@ class ProwlarrExtend(_PluginBase):
     # 插件图标
     plugin_icon = "Prowlarr.png"
     # 插件版本
-    plugin_version = "2.11"
+    plugin_version = "2.12"
     # 插件作者
     plugin_author = "milikii"
     # 作者主页
@@ -126,7 +127,13 @@ class ProwlarrExtend(_PluginBase):
             self.__update_config()
 
         if not synced_once and not self._indexers:
-            self.sync_indexers()
+            if self._host and self._api_key:
+                logger.info(f"【{self.plugin_name}】后台异步同步索引器，避免阻塞插件加载")
+                threading.Thread(
+                    target=self.sync_indexers,
+                    daemon=True,
+                    name="ProwlarrExtendInitSync",
+                ).start()
 
     def get_service(self) -> List[Dict[str, Any]]:
         if self._enabled and self._cron:
@@ -429,8 +436,7 @@ class ProwlarrExtend(_PluginBase):
             self.__get_indexer_id,
             self.plugin_name,
         )
-        if catalog:
-            self._indexer_catalog = catalog
+        self._indexer_catalog = catalog
 
     def __apply_indexer_selection(self, indexers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Empty selected_indexers means bridge all eligible indexers."""
@@ -503,6 +509,22 @@ class ProwlarrExtend(_PluginBase):
         if not indexer_id or not indexer_id.isdigit():
             logger.warning(f"【{self.plugin_name}】无法提取索引 ID，跳过站点：{site.get('name')}（domain={site.get('domain')}）")
             return results
+
+        # Skip stale virtual sites that are no longer part of the current bridge set.
+        # An empty authoritative snapshot means all indexers were removed; an empty
+        # non-authoritative state simply means we have not synced yet, so allow it.
+        if isinstance(self._indexers, list) and (self._indexers_authoritative or self._indexers):
+            current_ids = {
+                self.__get_indexer_id(item)
+                for item in self._indexers
+                if isinstance(item, dict)
+            }
+            if indexer_id not in current_ids:
+                logger.warning(
+                    f"【{self.plugin_name}】索引器 {indexer_id} 已不在桥接列表，"
+                    f"跳过残留站点：{site.get('name')}"
+                )
+                return results
 
         site_name = str(site.get("name") or "").replace(f"{self.plugin_name}-", "", 1)
         site_label = site.get("name") or site_name or indexer_id
@@ -696,6 +718,22 @@ class ProwlarrExtend(_PluginBase):
             return []
         return [site for site in sites if self.__is_managed_domain(getattr(site, "domain", ""))]
 
+    def __helper_indexer_matches(self, site_info: Any, indexer: Dict[str, Any]) -> bool:
+        """Return True when the SitesHelper entry already matches the desired virtual indexer."""
+        if not isinstance(site_info, dict):
+            return False
+        scalar_keys = (
+            "id", "url", "domain", "public", "privacy", "proxy",
+            "parser", "plugin", "result_num", "timeout",
+        )
+        for key in scalar_keys:
+            if site_info.get(key) != indexer.get(key):
+                return False
+        for key in ("search", "browse", "torrents"):
+            if site_info.get(key) != indexer.get(key):
+                return False
+        return True
+
     def __sync_helper_indexers(self) -> Tuple[int, int]:
         registered = 0
         updated = 0
@@ -705,7 +743,7 @@ class ProwlarrExtend(_PluginBase):
             if not site_info:
                 self.sites_helper.add_indexer(domain, copy.deepcopy(indexer))
                 registered += 1
-            elif site_info.get("id") != indexer.get("id") or site_info.get("url") != indexer.get("url"):
+            elif not self.__helper_indexer_matches(site_info, indexer):
                 self.sites_helper.add_indexer(domain, copy.deepcopy(indexer))
                 updated += 1
         return registered, updated
@@ -1040,9 +1078,6 @@ class ProwlarrExtend(_PluginBase):
         }
 
     def _ensure_sites_loaded(self) -> bool:
-        if isinstance(self._indexers, list) and len(self._indexers) > 0:
-            return True
-        self.get_status()
         return isinstance(self._indexers, list) and len(self._indexers) > 0
 
     def get_page(self) -> List[dict]:

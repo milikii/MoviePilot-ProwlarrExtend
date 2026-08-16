@@ -36,7 +36,7 @@ class MediaOpsMixin:
             return False
 
     def _scan_target(self, target: Path) -> Dict[str, Any]:
-        result = {"videos": [], "subtitles": [], "errors": []}
+        result = {"videos": [], "subtitles": [], "errors": [], "video_tracks": {}}
         if not target:
             result["errors"].append("未指定目标路径")
             return result
@@ -45,11 +45,18 @@ class MediaOpsMixin:
         result["videos"] = videos
 
         for video in videos:
-            result["subtitles"].extend(self._find_external_subtitles(video))
+            external_tracks = self._find_external_subtitles(video)
             try:
-                result["subtitles"].extend(self._probe_embedded_subtitles(video))
+                embedded_tracks = self._probe_embedded_subtitles(video)
+                result["video_tracks"][str(video)] = {
+                    "external": external_tracks,
+                    "embedded": embedded_tracks,
+                }
             except Exception as e:
+                embedded_tracks = []
                 result["errors"].append(f"{video}: {e}")
+            result["subtitles"].extend(external_tracks)
+            result["subtitles"].extend(embedded_tracks)
 
         if target.is_dir():
             associated = {str(track.path) for track in result["subtitles"] if track.path}

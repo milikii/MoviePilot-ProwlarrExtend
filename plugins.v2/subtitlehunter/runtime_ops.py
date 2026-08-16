@@ -379,6 +379,15 @@ class RuntimeOpsMixin:
         lines.append(f"时间：{self._now_text()}")
         return "\n".join(lines)
 
+    def _build_multi_start_notify_text(self, source: str, target_count: int, first_target: Path) -> str:
+        """Build a readable notification for multi-target workflow start."""
+        return "\n".join([
+            f"媒体：{target_count} 个目标",
+            f"来源：{source}",
+            f"目标：{self._compact_notify_path(first_target)} 等 {target_count} 个",
+            f"开始时间：{self._now_text()}",
+        ])
+
     def _build_start_notify_text(
         self,
         source: str,

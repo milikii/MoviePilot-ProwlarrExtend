@@ -176,6 +176,10 @@ class WorkflowMixin:
         logger.info(f"【{self.plugin_name}】开始多目标字幕任务：{total} 个目标")
         display_name = f"{total} 个目标"
         started_at = self._start_run(source=source, target=targets[0], display_name=display_name)
+        self._send_notify(
+            "开始处理字幕",
+            self._build_multi_start_notify_text(source, total, targets[0]),
+        )
         aggregate = {
             "processed": 0,
             "skipped": 0,
@@ -261,6 +265,7 @@ class WorkflowMixin:
             media_context = self._build_media_context(mediainfo, target)
             scan = self._scan_target(target)
             videos = scan["videos"]
+            video_tracks = scan.get("video_tracks") or {}
             if not videos:
                 message = f"未发现视频文件：{target}"
                 logger.warning(f"【{self.plugin_name}】{message}")
@@ -302,7 +307,7 @@ class WorkflowMixin:
 
             for video in videos:
                 self._raise_if_cancelled()
-                detail = self._ensure_video_chinese(video, media_context)
+                detail = self._ensure_video_chinese(video, media_context, video_tracks=video_tracks)
                 details.append(detail)
                 summary["processed"] += 1
                 summary["skipped"] += 1 if detail["status"] in {"已有中文", "已跳过"} else 0
@@ -372,7 +377,12 @@ class WorkflowMixin:
                 self._build_failure_notify_text(source, display_name, target, e),
             )
 
-    def _ensure_video_chinese(self, video_path: Path, media_context: str) -> Dict[str, Any]:
+    def _ensure_video_chinese(
+        self,
+        video_path: Path,
+        media_context: str,
+        video_tracks: Optional[Dict[str, Dict[str, List[SubtitleTrack]]]] = None,
+    ) -> Dict[str, Any]:
         detail = {
             "video": str(video_path),
             "status": "处理中",
@@ -384,8 +394,13 @@ class WorkflowMixin:
         }
 
         try:
-            external_tracks = self._find_external_subtitles(video_path)
-            embedded_tracks = self._probe_embedded_subtitles(video_path)
+            prefetched = (video_tracks or {}).get(str(video_path)) if video_tracks else None
+            if prefetched:
+                external_tracks = list(prefetched.get("external") or [])
+                embedded_tracks = list(prefetched.get("embedded") or [])
+            else:
+                external_tracks = self._find_external_subtitles(video_path)
+                embedded_tracks = self._probe_embedded_subtitles(video_path)
             all_tracks = external_tracks + embedded_tracks
 
             if self._rename_existing:
@@ -423,16 +438,16 @@ class WorkflowMixin:
                     detail["message"] = "已提取内嵌中文字幕为外挂字幕"
                     return detail
 
-            english_source = self._select_english_source(video_path, external_tracks, embedded_tracks, detail)
-            if not english_source:
-                detail["status"] = "失败"
-                detail["message"] = "未找到可翻译的英文文本字幕"
-                return detail
-
             ai_config, ai_error = self._resolve_ai_config()
             if not ai_config:
                 detail["status"] = "已跳过"
                 detail["message"] = f"没有中文字幕，但 AI 翻译不可用：{ai_error}"
+                return detail
+
+            english_source = self._select_english_source(video_path, external_tracks, embedded_tracks, detail)
+            if not english_source:
+                detail["status"] = "已跳过"
+                detail["message"] = "未找到可翻译的英文文本字幕"
                 return detail
 
             translated_path = self._translated_subtitle_path(video_path, english_source)
@@ -455,6 +470,14 @@ class WorkflowMixin:
                 detail["translated_files"].append(str(translated_path))
                 detail["status"] = "已生成中文"
                 detail["message"] = message
+                if not self._keep_intermediate and str(english_source) in detail["extracted_files"]:
+                    try:
+                        english_source.unlink(missing_ok=True)
+                        detail["extracted_files"] = [
+                            path for path in detail["extracted_files"] if path != str(english_source)
+                        ]
+                    except OSError as e:
+                        detail["errors"].append(f"清理中间字幕失败：{e}")
             else:
                 detail["status"] = "失败"
                 detail["message"] = message
@@ -475,22 +498,52 @@ class WorkflowMixin:
         embedded_tracks: List[SubtitleTrack],
         detail: Dict[str, Any],
     ) -> Optional[Path]:
-        external_english = [
+        # Forced subtitles are usually signs/dialog fragments, not full-dialogue
+        # sources, so exclude them from translation candidates.
+        external_text = [
             track for track in external_tracks
-            if track.path and track.path.suffix.lower() in self._TRANSLATABLE_EXTS
-            and self._is_english_language(track.language, track.title, track.path)
+            if track.path
+            and track.path.suffix.lower() in self._TRANSLATABLE_EXTS
+            and not track.forced
+        ]
+        external_english = [
+            track for track in external_text
+            if self._is_english_language(track.language, track.title, track.path)
         ]
         if external_english:
             return external_english[0].path
 
-        embedded_english = [
+        # Fallback: an unmarked/other-language external text subtitle is better
+        # than doing nothing, as long as it is not a forced track.
+        external_other = [
+            track for track in external_text
+            if not self._is_chinese_language(track.language, track.title, track.path)
+        ]
+        if external_other:
+            return external_other[0].path
+
+        external_forced = [
+            track for track in external_tracks
+            if track.path
+            and track.path.suffix.lower() in self._TRANSLATABLE_EXTS
+            and track.forced
+            and self._is_english_language(track.language, track.title, track.path)
+        ]
+        if external_forced:
+            detail["errors"].append("仅找到强制外挂英文字幕，不适合作为全文翻译源")
+
+        embedded_text = [
             track for track in embedded_tracks
-            if track.text_based and self._is_english_language(track.language, track.title, track.path)
+            if track.text_based and not track.forced
+        ]
+        embedded_english = [
+            track for track in embedded_text
+            if self._is_english_language(track.language, track.title, track.path)
         ]
         if not embedded_english:
             embedded_english = [
-                track for track in embedded_tracks
-                if track.text_based and not self._is_chinese_language(track.language, track.title, track.path)
+                track for track in embedded_text
+                if not self._is_chinese_language(track.language, track.title, track.path)
             ]
 
         for track in embedded_english:
@@ -499,6 +552,14 @@ class WorkflowMixin:
                 detail["extracted_files"].append(str(output))
                 return output
             detail["errors"].append(message)
+
+        forced_english = [
+            track for track in embedded_tracks
+            if track.text_based and track.forced
+            and self._is_english_language(track.language, track.title, track.path)
+        ]
+        if forced_english:
+            detail["errors"].append("仅找到强制英文字幕，不适合作为全文翻译源")
 
         image_english = [
             track for track in embedded_tracks

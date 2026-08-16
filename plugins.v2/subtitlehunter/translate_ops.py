@@ -293,7 +293,7 @@ class TranslateOpsMixin:
                 last_error = e
                 if attempt >= attempts - 1:
                     break
-                delay = max(1, self._api_timeout // 60) * (attempt + 1)
+                delay = min(300, max(1, 5 * (2 ** min(attempt, 6))))
                 logger.warning(
                     f"【{self.plugin_name}】{stage_name}失败，"
                     f"{delay}s 后重试 {attempt + 1}/{self._api_retries}：{e}"
@@ -459,7 +459,10 @@ class TranslateOpsMixin:
         if ai_config.get("user_agent"):
             headers["User-Agent"] = ai_config["user_agent"]
         try:
-            proxies = getattr(settings, "PROXY", None) if ai_config.get("use_proxy") else None
+            if ai_config.get("use_proxy"):
+                proxies = getattr(settings, "PROXY", None)
+            else:
+                proxies = {"http": None, "https": None}
             response = requests.post(
                 url,
                 headers=headers,
@@ -567,7 +570,7 @@ class TranslateOpsMixin:
                 last_error = e
                 if attempt >= attempts - 1:
                     break
-                delay = max(1, self._api_timeout // 60) * (attempt + 1)
+                delay = min(300, max(1, 5 * (2 ** min(attempt, 6))))
                 logger.warning(
                     f"【{self.plugin_name}】术语抽取失败，"
                     f"{delay}s 后重试 {attempt + 1}/{self._api_retries}：{e}"

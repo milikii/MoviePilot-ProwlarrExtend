@@ -373,3 +373,83 @@ def test_split_target_paths_supports_comma_variants(plugin_modules):
     split = plugin_modules.subtitle.SubtitleHunter._split_target_paths
     assert split("/a,/b，/c") == ["/a", "/b", "/c"]
     assert split("  ") == []
+
+
+def test_select_english_source_uses_generic_external_and_filters_forced(plugin_modules, tmp_path):
+    module = plugin_modules.subtitle
+    plugin = _plugin(plugin_modules, tmp_path)
+    video = tmp_path / "movie.mkv"
+    forced = tmp_path / "movie.en.forced.srt"
+    generic = tmp_path / "movie.srt"
+    forced.touch()
+    generic.touch()
+
+    forced_track = module.SubtitleTrack(
+        source="external", path=forced, video_path=video, stream_index=None,
+        codec="srt", language="en", title="movie.en.forced", forced=True,
+        default=False, text_based=True, extension=".srt",
+    )
+    generic_track = module.SubtitleTrack(
+        source="external", path=generic, video_path=video, stream_index=None,
+        codec="srt", language="", title="movie", forced=False,
+        default=False, text_based=True, extension=".srt",
+    )
+
+    detail = {}
+    result = plugin._select_english_source(video, [forced_track, generic_track], [], detail)
+
+    assert result == generic
+
+
+def test_select_english_source_rejects_forced_only(plugin_modules, tmp_path):
+    module = plugin_modules.subtitle
+    plugin = _plugin(plugin_modules, tmp_path)
+    video = tmp_path / "movie.mkv"
+    forced = tmp_path / "movie.en.forced.srt"
+    forced.touch()
+
+    forced_track = module.SubtitleTrack(
+        source="external", path=forced, video_path=video, stream_index=None,
+        codec="srt", language="en", title="movie.en.forced", forced=True,
+        default=False, text_based=True, extension=".srt",
+    )
+
+    detail = {"errors": []}
+    result = plugin._select_english_source(video, [forced_track], [], detail)
+
+    assert result is None
+    assert any("强制" in error for error in detail["errors"])
+
+
+def test_keep_intermediate_false_cleans_extracted_english_after_translation(plugin_modules, tmp_path):
+    module = plugin_modules.subtitle
+    plugin = _plugin(plugin_modules, tmp_path)
+    plugin._rename_existing = False
+    plugin._ai_enabled = True
+    plugin._keep_intermediate = False
+
+    video = tmp_path / "movie.mkv"
+    video.touch()
+    intermediate = tmp_path / "movie.en.stream0.srt"
+
+    embedded_track = module.SubtitleTrack(
+        source="embedded", path=None, video_path=video, stream_index=0,
+        codec="srt", language="en", title="English", forced=False,
+        default=False, text_based=True, extension=".srt",
+    )
+
+    plugin._find_external_subtitles = lambda _video: []
+    plugin._probe_embedded_subtitles = lambda _video: [embedded_track]
+    plugin._resolve_ai_config = lambda: ({"model": "test", "source": "custom"}, "")
+
+    def fake_extract(track):
+        intermediate.write_text("dummy", encoding="utf-8")
+        return True, intermediate, "ok"
+
+    plugin._extract_embedded_subtitle = fake_extract
+    plugin._translate_subtitle_file = lambda **kwargs: (True, "translated")
+
+    result = plugin._ensure_video_chinese(video, "context")
+
+    assert result["status"] == "已生成中文"
+    assert not intermediate.exists()

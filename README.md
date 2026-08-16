@@ -90,6 +90,8 @@ SubtitleHunter 接管入库完成（`transfer.complete`）那一刻，对整理�
 | 启用插件 | 总开关 |
 | 入库后自动确保中文 | 监听 `transfer.complete`，对整理后的媒体库路径跑工作流 |
 | 规范化外挂字幕命名 | 把同目录字幕改成媒体服务器更友好的命名 |
+| 覆盖已有字幕 | 覆盖已存在的同名目标字幕 |
+| 保留提取的中间字幕 | 关闭后，翻译成功会自动清理为翻译而提取的英文字幕文件 |
 | 提取内嵌中文字幕 | 已有内嵌中文就抽成外挂并跳过翻译 |
 | 启用 AI 翻译 | 没中文时调模型翻英文文本字幕 |
 | 模型来源 | 系统智能助手（默认）或自定义 OpenAI 兼容 API |
@@ -132,8 +134,9 @@ SubtitleHunter 接管入库完成（`transfer.complete`）那一刻，对整理�
 
 ## 版本
 
-当前 SubtitleHunter 为 v2.18：
+当前 SubtitleHunter 为 v2.19：
 
+- v2.19 英文源支持无标记外挂字幕并排除 forced；AI 不可用不再提取中间字幕；实现 keep_intermediate 清理；多目标开始通知；无英文源改为跳过；代理禁用修复；指数退避；扫描结果复用避免重复 ffprobe
 - v2.4 AI 自动术语表、行长度后校验、句边界感知分批
 - v2.5 定时执行（cron）+ 带预计完成时间的启动通知
 - v2.6 通知排版（任务范围、耗时、产物路径、失败原因）
@@ -150,7 +153,7 @@ SubtitleHunter 接管入库完成（`transfer.complete`）那一刻，对整理�
 - v2.17 抽取 batching/linecheck 纯模块与术语解析
 - v2.18 修复 mixin MRO，确保 get_form/get_page/stop_service 可加载
 
-当前 ProwlarrExtend 为 v2.11：搜索超时可配置，失败区分超时/HTTP 错误/空结果并记录条数耗时；v2.10 起多选逻辑在 `selection` 模块；v2.8 起支持桥接索引器多选（空=全部）。完整历史见 [`package.v2.json`](./package.v2.json)。
+当前 ProwlarrExtend 为 v2.12：搜索超时可配置，失败区分超时/HTTP 错误/空结果并记录条数耗时；v2.12 起搜索会跳过已不在桥接列表的残留虚拟站点，初始化/详情页不再阻塞；v2.10 起多选逻辑在 `selection` 模块；v2.8 起支持桥接索引器多选（空=全部）。完整历史见 [`package.v2.json`](./package.v2.json)。
 
 ## 来源
 

@@ -138,6 +138,23 @@ class UIMixin:
                                 "component": "VCol",
                                 "props": {"cols": 12, "md": 3},
                                 "content": [{
+                                    "component": "VSwitch",
+                                    "props": {
+                                        "model": "keep_intermediate",
+                                        "label": "保留提取的中间字幕",
+                                        "hint": "关闭后，翻译成功会自动清理为翻译而提取的英文字幕文件",
+                                    },
+                                }],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 3},
+                                "content": [{
                                     "component": "VSelect",
                                     "props": {
                                         "model": "model_source",
