@@ -181,7 +181,7 @@ class ProwlarrExtendV3Tests(unittest.TestCase):
 
     def test_package_v3_matches_plugin_version(self):
         package = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
-        self.assertEqual(set(package), {"ProwlarrExtend"})
+        self.assertEqual(set(package), {"ProwlarrExtend", "SubtitleHunter"})
         self.assertEqual(package["ProwlarrExtend"]["version"], self.module.ProwlarrExtend.plugin_version)
 
     def test_empty_site_aggregates_selected_indexers_and_deduplicates(self):

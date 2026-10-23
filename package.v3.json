@@ -10,5 +10,17 @@
     "history": {
       "v3.0.0": "v3 首版：采用插件资源源架构，聚合所选 Prowlarr 索引器，不再依赖站点桥接"
     }
+  },
+  "SubtitleHunter": {
+    "name": "SubtitleHunter",
+    "description": "入库后自动检测、提取、翻译并规范化字幕",
+    "labels": "字幕,中文字幕,AI翻译,ffmpeg",
+    "version": "3.0.0",
+    "icon": "subtitle.png",
+    "author": "milikii",
+    "level": 1,
+    "history": {
+      "v3.0.0": "v3 首版：自 v2.19 移植（配置与工作流不变），并修复字幕正确性问题——SRT 解析不再静默丢条、cue 唯一 ID 防串译、逐条覆盖校验、forced 判断收紧、标签保全、失败不替换原文件、翻译重试分类与总预算"
+    }
   }
 }

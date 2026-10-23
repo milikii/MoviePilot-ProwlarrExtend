@@ -27,3 +27,11 @@
 1. ProwlarrExtend 的 v3 版应是「插件资源源」：`search_torrents(site={}, ...)` 时扇出到所选 Prowlarr 索引器（优先单个带多 indexerIds 的聚合请求），结果 TorrentInfo 保留真实索引器身份（标题/下载链接/大小/做种数等按 TorrentInfo 契约填），彻底删除 SitesHelper / Site CRUD / IndexerSites / 假域名一整套。
 2. SubtitleHunter 与宿主耦合较浅（事件 + 文件/媒体处理），可机械移植到 plugins.v3 并顺带修已证实的正确性问题（见 GPT_REVIEW.md 第三步清单）。
 3. 本仓现有用户的实际环境 = NAS v3.1.9 + NAS 上的 Prowlarr 容器（lscr.io/linuxserver/prowlarr），迁移验收最终要在这个真实环境做。
+
+## 第二批（SubtitleHunter）宿主契约实测（2026-10-23，NAS v3.1.9 双路核对）
+
+- v2 SubtitleHunter 的全部宿主 import 在 v3.1.9 容器内逐条实测可导入：`app.log.logger`、`app.plugins._PluginBase`、`app.core.context.MediaInfo`、`app.core.event.eventmanager/Event`、`app.core.config.settings`、`app.schemas.types.NotificationType/EventType`（兼容层健在）。
+- `_PluginBase` 实现在 `/app/app/sdk/plugin/base.py`：`update_config`(:320)、`get_config`(:334)、`get_data_path`(:343)、`save_data`(:366)、`get_data`(:391)、`post_message`(:425) 均在；内置 v3 插件 autosubv2 实际以 `post_message(mtype=NotificationType.Plugin, ...)` 与 `get_data_path()` 使用之。
+- 事件契约：`EventType.TransferComplete = "transfer.complete"`（`/app/app/schemas/types.py:280`）；事件 `event_data` 含 `mediainfo` 与 `transferinfo` 两键（v2 处理器与 autosubv2 的 v3 处理器读法一致，`:291` `@eventmanager.register(EventType.TransferComplete)`）；`transferinfo.target_path` 存在（`/app/app/schemas/download.py:108`），另有 `file_list_new`（autosubv2 实际使用）。
+- 系统 LLM 默认值：宿主 chatgpt 插件以 `getattr(settings, "LLM_PROVIDER"/"LLM_API_KEY", None)` 读取，与 v2 SubtitleHunter 的读法一致，v3.1.9 仍有效。翻译本身是插件自带 OpenAI 兼容 HTTP 客户端（用户配置的 base_url/api_key），不依赖宿主 LLM 通道。
+- 注意（第一批教训）：`MediaInfo` 同样有 `app/domain/context.py:1907` 的 dataclass 版与 `app/schemas/context.py:280` 的 pydantic 版两个同名类；SubtitleHunter 只以 getattr 读 mediainfo 属性（title_year/title/original_language 等），属鸭子类型，**不要构造 MediaInfo、不要 isinstance 判断**。
