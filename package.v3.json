@@ -1,0 +1,14 @@
+{
+  "ProwlarrExtend": {
+    "name": "ProwlarrExtend",
+    "description": "扩展检索以支持Prowlarr站点资源",
+    "labels": "索引器,Prowlarr",
+    "version": "3.0.1",
+    "icon": "Prowlarr.png",
+    "author": "milikii",
+    "level": 1,
+    "history": {
+      "v3.0.0": "v3 首版：采用插件资源源架构，聚合所选 Prowlarr 索引器，不再依赖站点桥接"
+    }
+  }
+}

@@ -1,0 +1,1536 @@
+MoviePilot-ProwlarrExtend 代码审查
+
+
+
+0. 一句话判决
+如果只做三件事
+
+1. 先承认优点（否则不公平）
+
+2. P0：阻塞上线或直接产生错误结果的问题
+P0-1 MoviePilot v3 上核心链路已断（三处独立硬断点）
+
+P0-2 字幕解析器会静默丢条目
+
+P0-3 ASS / SRT 的样式与定位标签在翻译后全部丢失
+
+3. P1：正确性与可靠性问题
+P1-1 FORCED_PATTERNS 把正常片名误判为 forced
+
+P1-2 中文覆盖率 50% 就能放行“半英文”译文
+
+P1-3 翻译重试是“有界地卡死”，且没有输出上限
+
+P1-4 “复用系统智能助手”并没有真正复用
+
+P1-5 非 UTF-8 字幕会被静默损坏
+
+P1-6 季包入库只处理第一集
+
+P1-7 后台任务锁是进程内的，重载/多 worker 会双跑
+
+P1-8 HTTP API 接受任意路径，存在越权读写风险
+
+P1-9 __request_json 把 4xx/5xx 全部当成“无响应”
+
+P1-10 test_connection 有副作用，会改写同步状态
+
+P1-11 插件强行改写 SystemConfigKey.IndexerSites
+
+P1-12 假站点污染 Site 表，且无法通过健康检查
+
+4. P2：架构与可维护性
+4.1 度量数据
+
+4.2 虚拟站点是“架构谎言”
+
+4.3 Mixin 不是模块化，是分布式上帝类
+
+4.4 状态机是字符串
+
+4.5 配置默认值有三份，迁移是临时的
+
+4.6 get_form 是手写 JSON 的泥石流
+
+4.7 异常处理：31 处 blind except，另有 3 处静默 pass/continue
+
+4.8 可观测性：日志有，但没有关联 ID
+
+4.9 Prowlarr API Key 可能进入日志/下载历史
+
+5. 测试与 CI 的真实水平
+5.1 做得好的地方
+
+5.2 致命问题：测试定义了自己要验证的宿主
+
+5.3 缺失的测试类型
+
+5.4 几个具体弱测试
+
+5.5 CI 不可复现
+
+5.6 发布流程：没有 release，等于没有回滚
+
+6. 文档的可信度问题
+
+7. 重构方案
+7.1 目标与原则
+
+7.2 ProwlarrExtend 目标架构
+
+7.3 SubtitleHunter 目标架构
+
+7.4 迁移阶段
+
+7.5 如果只有两个周末
+
+8. 优先级矩阵
+
+9. 结论
+最后一句
+
+附录 A：复现命令与关键输出
+A.1 单测
+
+A.2 Ruff
+
+A.3 复杂度
+
+A.4 FORCED 误判
+
+A.5 50% 覆盖率放行
+
+A.6 SRT 变体丢条
+
+A.7 ASS 样式丢失
+
+A.8 requests.Response 布尔行为
+
+附录 B：逐文件问题索引
+
+附录 C：参考的 MoviePilot 源码位置
+
+附录 D：一句话清单（给 commit / issue 用）
+
+
+
+
+  CODE REVIEW · 2026-10-23
+
+  MoviePilot-ProwlarrExtend
+代码审查与重构方案
+
+  工程习惯合格，架构地基错误。54 个测试全绿，但它们在测试自己写的宿主替身，而不是 MoviePilot。
+
+
+    仓库 milikii/MoviePilot-ProwlarrExtend
+    commit f20bf13
+    对照 MoviePilot v3.1.9 / v2.14.0
+
+
+
+    P0 阻塞
+    P1 正确性 / 可靠性
+    P2 可维护性
+
+
+
+审查对象：milikii/MoviePilot-ProwlarrExtend，main@f20bf13（2026-08-16）
+审查范围：ProwlarrExtend 与 SubtitleHunter 两个插件，重点为 ProwlarrExtend
+对照宿主：MoviePilot v3.1.9（2026-10-22）与 v2.14.0（2026-06-30）
+审查方式：全量源码阅读、静态分析、单测复跑、关键行为最小复现；未接入真实 Prowlarr / MoviePilot 容器
+
+0. 一句话判决
+
+工程习惯是合格的，甚至高于 MoviePilot 插件圈的平均水平；但架构地基是错的，而且测试把地基整个 mock 掉了，所以 54 个绿灯没有一条能告诉你：插件在 MoviePilot v3 上已经不再工作。
+
+如果只服务你自己的 v2.9 环境，主观分可以给到 6.5/10；按“公开维护、面向当前宿主、长期可演进”的标准，4.5/10。
+
+维度
+分数
+判决
+
+问题定义 / 产品价值
+8/10
+真实痛点：Prowlarr 接管国际私有站，MoviePilot 原生索引器覆盖不到
+
+代码可读性
+7/10
+命名清楚、注释到位、纯函数抽取方向正确
+
+架构设计
+3/10
+虚拟站点是把插件逻辑塞进宿主站点模型的“谎言”，下游全靠补丁兜底
+
+正确性 / 鲁棒性
+4/10
+解析器静默丢条目、forced 误判、50% 质量门、重试风暴
+
+测试有效性
+4/10
+数量不少，但宿主 API 全是自建替身，无法发现契约漂移
+
+兼容性
+2/10
+v3 两处硬断点，核心搜索链路已失效，无版本矩阵
+
+可维护性
+4/10
+1211 行上帝类、367 行 get_form、mixin 分布式上帝类、字符串状态机
+
+文档
+6/10
+量大，但存在过度承诺（“复用系统助手”“失败有界”）与未更新的风险表
+
+工程流程
+5/10
+CI 存在但不可复现；无 lint 配置、无 release/tag、无回滚策略
+
+综合
+4.5/10
+自用 v2 可用；公开维护 v3 不合格
+
+如果只做三件事
+
+把 ProwlarrExtend 从“虚拟站点”改成 v3 的 plugin source：search_torrents(site={}) 时扇出到全部桥接索引器，删掉 SitesHelper.add_indexer 与 Site 写入。这是“能不能用”的问题。
+
+修字幕数据正确性：SRT/ASS 解析、样式保留、forced 误判、中文覆盖率。这是“结果对不对”的问题。
+
+把测试从“mock 宿主”改成“契约 + 假 Prowlarr + 黄金字幕”。这是“以后还会不会再塌”的问题。
+
+1. 先承认优点（否则不公平）
+
+这套代码不是“烂项目”。它有明显的工程自觉：
+
+纯函数抽取方向正确。mapping.py、selection.py、search_http.py、formats.py、quality.py、batching.py、linecheck.py、eta.py、language.py、codes.py 都是可独立测试的纯逻辑，这在 MoviePilot 插件里很少见。
+
+字幕写盘是原子的：临时文件 + os.replace，失败不留半成品（translate_ops.py:59-65）。
+
+翻译缓存设计认真：按阶段、模型、上下文、术语表、批次联合 key，缓存不写媒体库、不缓存 API Key（translate_ops.py:305-375）。
+
+有取消、有状态持久化、有阶段耗时、有 failure_code。这些是可观测性的正确方向。
+
+有版本契约测试：plugin_version 必须与 package.v2.json 一致（tests/test_contracts.py:109-112），这是个好习惯。
+
+PT 场景细节考虑到位：freeleech 倍率、forced 字幕、只写外挂字幕不动 MKV、做种校验、keep_intermediate 清理。
+
+文档量大：README、PLAN、MAINTENANCE、CLAUDE.md 都有，说明作者有长期维护的意图。
+
+问题不在于“不会写代码”，而在于把聪明用在了错误的地基上。
+
+2. P0：阻塞上线或直接产生错误结果的问题
+
+P0-1　MoviePilot v3 上核心链路已断（三处独立硬断点）
+
+这不是“未来风险”，是当前事实。插件写的是 MoviePilot v2.14.0（2026-06-30）的 API，本仓库最后提交是 2026-08-16；v3.0.0 于 2026-09-12 发布，v3.1.9 于 2026-10-22 发布。作者当时不可能预知 v3，但今天必须补这笔迁移债。
+
+如果这是有意的产品边界，README 必须明确写“仅支持 v2.14.x，不支持 v3”，并在插件市场标注；否则 v3 用户安装后看到的是“已启用、有索引器列表、但搜不到任何东西”。这比直接报错更糟。
+
+断点 A：SitesHelper.add_indexer 已不在 v3 的公开接口里
+
+插件在 __sync_helper_indexers 中注册虚拟站点：
+
+# plugins.v2/prowlarrextend/__init__.py:744
+self.sites_helper.add_indexer(domain, copy.deepcopy(indexer))
+
+而 v3 的公开类型声明 app/application/site/sites.pyi 中没有 add_indexer，整个 v3 源码也没有任何调用点。即使编译产物里还残留这个方法，它也已经不是契约；依赖它就是在赌下一次构建。
+
+断点 B：Site 的 db=None 兼容层被移除
+
+插件全程用 None 代替数据库会话：
+
+# plugins.v2/prowlarrextend/__init__.py:785-808
+site = Site.get_by_domain(None, domain)
+Site(**payload).create(None)
+site.update(None, update_payload)
+Site.delete(None, legacy_site.id)
+
+v2 的 @db_query / @db_update 装饰器会在 db=None 时自动开 session；v3 去掉了这层兼容：
+
+# MoviePilot v3.1.9 app/db/models/site.py:66-70
+def get_by_domain(cls, db: Session, domain: str) -> Optional[Self]:
+    site = db.execute(select(cls).where(cls.domain == domain)).scalars().first()
+
+db=None 时直接 AttributeError: 'NoneType' object has no attribute 'execute'。也就是说，即使 add_indexer 还在，同步也会在下一步崩掉。
+
+断点 C：v3 的搜索链只给插件传 site={}，不再传真实站点
+
+v3 把“插件资源源”和“站点索引器”拆成了两条路径：
+
+# MoviePilot v3.1.9 app/chain/base.py:659-673
+def search_plugin_torrents(self, keyword, mtype=None, page=0):
+    return self._module_dispatcher.execute_plugin_modules(
+        "search_torrents", None, site={}, keyword=keyword, mtype=mtype, page=page
+    ) or []
+
+def search_site_torrents(self, site, keyword, mtype=None, page=0):
+    return self._module_dispatcher.execute_system_modules(
+        "search_torrents", None, site=site, keyword=keyword, mtype=mtype, page=page
+    ) or []
+
+插件只会被 search_plugin_torrents 调用，site={}。
+
+插件的 search_torrents 第一行就是 if not site: return []（__init__.py:502-503），所以永远返回空。
+
+带 site 的那条路径只执行 system modules，插件的 get_module() 注册在 _plugin_catalog，不在 _module_catalog，永远收不到调用。
+
+v2 不是这样。v2.14.0 的搜索入口仍然 self.search_torrents(site=site, ...)（app/chain/search.py:1815-1824），插件能收到 site。v3 把这条路径拆了，插件的核心机制随之失效。
+
+失败时的表现很具有欺骗性
+
+sync_indexers 在崩溃前已经做了两件事：
+
+self._indexers = indexers                 # 索引器列表已就绪
+self.__persist_indexer_metadata()         # catalog 已写回配置
+
+然后才在 __sync_helper_indexers 或 __sync_site_records 崩溃。结果是：
+
+插件详情页可能显示“已桥接 N 个索引器”；
+
+表单里的多选列表有数据；
+
+但 MoviePilot 搜索永远没有 Prowlarr 结果；
+
+日志里只有线程异常或 cron 异常，普通用户很难把两者联系起来。
+
+这比“安装即报错”更糟：它看起来是好的。
+
+为什么测试没发现
+
+因为测试把这三个契约全部替换成了自己写的替身：
+
+# tests/conftest.py:87-97
+_install_module("app.helper.sites", SitesHelper=type("SitesHelper", (), {
+    "get_indexer": lambda self, domain: None,
+    "add_indexer": lambda self, domain, value: None,   # ← 替身定义了真实宿主已删除的方法
+}))
+
+# tests/conftest.py:120
+_install_module("app.db.models.site", Site=type("Site", (), {}))
+
+# tests/test_prowlarrextend.py:162-181
+class Site:
+    @classmethod
+    def get_by_domain(cls, _db, domain): ...   # ← 接受 None，和 v2 一样
+
+测试不是验证“插件是否符合宿主”，而是验证“插件是否符合测试自己写的宿主”。 宿主 API 一漂移，测试全绿，线上全挂。这是这套测试最根本的问题。
+
+修法方向：v3-first，把插件做成 plugin source；site={} 时扇出到全部桥接索引器；彻底删除 SitesHelper.add_indexer、Site CRUD、假域名、SystemConfigKey.IndexerSites 写入。具体见第 7 节。
+
+P0-2　字幕解析器会静默丢条目
+
+SRT_TIME 只接受“2 位小时 + 3 位毫秒”：
+
+# plugins.v2/subtitlehunter/constants.py:31-34
+SRT_TIME = re.compile(
+    r"(?P<start>\d{2}:\d{2}:\d{2}[,.]\d{3})\s+-->\s+"
+    r"(?P<end>\d{2}:\d{2}:\d{2}[,.]\d{3})(?P<tail>.*)"
+)
+
+parse_srt 对不匹配的块直接 continue，不计数、不告警：
+
+# plugins.v2/subtitlehunter/formats.py:52-54
+match = SRT_TIME.match(lines[0].strip())
+if not match:
+    continue
+
+实测：
+
+输入时间轴
+解析结果
+
+0:00:01,00 --> 0:00:02,00
+0 条
+
+00:00:01.5 --> 00:00:02.5
+0 条
+
+00:00:01,000 --> 00:00:02,000
+1 条
+
+现实里 0:00:01,00（1 位小时 + 2 位毫秒）和 00:00:01.5（1 位小数）并不罕见，尤其是老片、非英语字幕、手工转制的 SRT。结果：
+
+整文件都是这种格式 → _translate_subtitle_file 返回“未解析到有效字幕条目”，任务失败；
+
+文件里混合了标准与非标准块 → 只翻译能解析的部分，输出的中文字幕缺行，而 validate_translated_cues 只比较“解析后的 source”和“解析后的译文”，两边都缺同样的行，所以校验通过。
+
+这是静默的数据损失，不是崩溃。 用户看到的是一条“翻译完成”的通知，播放时才发现中间少了几句。
+
+修法：解析器接受 1–2 位小时、1–3 位毫秒、./, 分隔；统计 skipped_blocks；跳过比例超过阈值（例如 2%）时直接失败并给出样例；用黄金字幕集做回归。
+
+P0-3　ASS / SRT 的样式与定位标签在翻译后全部丢失
+
+翻译输入前会剥掉所有标签：
+
+# plugins.v2/subtitlehunter/formats.py:12-16
+def plain_subtitle_text(text: str) -> str:
+    cleaned = re.sub(r"<[^>]+>", "", text or "")
+    cleaned = re.sub(r"\{[^}]*}", "", cleaned)
+    ...
+
+ASS 的 {\an8}（顶部定位）、{\pos(...)}、{\i1}（斜体）、卡拉 OK 标签，以及 SRT 的 <i>，都在这一步被删除。翻译完成后，render_ass 把纯译文写回 Text 字段：
+
+# plugins.v2/subtitlehunter/formats.py:117-123
+fields[cue.ass_text_index] = (cue.text or "").replace("\n", "\\N")
+lines[cue.line_index] = "Dialogue: " + ",".join(fields)
+
+实测：
+
+原文：  {\an8}Hello world
+译文：  你好世界
+
+{\an8} 没了。顶部提示（标识、歌词、屏幕文字）会掉到画面底部；斜体、颜色、定位全部失效。
+
+对于“能看就行”的用户，这是小问题；对于 ASS 字幕，这是样式灾难。README 说“适合 Jellyfin/Emby/Plex 字幕播放”，但没有提样式丢失。
+
+修法：在 SubtitleCue 上保存 style_prefix / style_suffix（或一个 tag mask），翻译只处理纯文本，渲染时把标签拼回去；SRT 的 <i> 同理。更彻底的做法是“掩码—翻译—还原”：把标签替换成 \u0000{n}\u0000 占位符，翻译后按占位符还原。
+
+3. P1：正确性与可靠性问题
+
+P1-1　FORCED_PATTERNS 把正常片名误判为 forced
+
+# plugins.v2/subtitlehunter/constants.py:27-30
+FORCED_PATTERNS = re.compile(
+    r"(^|[._\-\s\[\]()])(forced|foreign|only|signs?)(?=$|[._\-\s\[\]()])|强制|特效",
+    re.IGNORECASE,
+)
+
+only、signs、foreign 作为独立 token 出现在片名里时，会被当成 forced：
+
+文件名
+forced
+
+The.Only.Living.Boy.2018.en.srt
+True
+
+Signs.2002.en.srt
+True
+
+Foreign.Correspondent.1940.en.srt
+True
+
+Only.The.Brave.2017.en.srt
+True
+
+movie.en.forced.srt
+True（正确）
+
+后果：
+
+_select_english_source 把 forced 排除出翻译源，于是这些片子“找不到英文源”或被跳过；
+
+_is_usable_external_chinese_track 也拒绝 forced，已有的中文字幕可能被当成不可用；
+
+用户完全不知道为什么这两部片子不翻译。
+
+修法：forced 只应匹配“语言标签之后的修饰词”，例如 \.(forced|foreign)\.(srt|ass|ssa)$；删除 only / signs；用一组真实片名做回归测试。
+
+P1-2　中文覆盖率 50% 就能放行“半英文”译文
+
+# plugins.v2/subtitlehunter/constants.py:37
+CHINESE_COVERAGE_THRESHOLD = 0.5
+
+has_chinese_cue_coverage 只统计“含中文或英文的行”，中文行占比 ≥ 50% 即通过。实测：
+
+原文 4 条英文
+译文 2 条中文 + 2 条英文
+validate_translated_cues -> (True, "")
+
+也就是说，模型只翻了一半，质量门放行。对于 1500 条的电影字幕，750 条英文留在中文字幕里，用户会看到中英混杂，而插件报告“完成”。
+
+修法：
+- 覆盖率阈值提到 0.9；
+- 增加逐条检查：源文本超过 N 个拉丁词、译文却完全没有中文 → 记为失败；
+- 区分“短感叹词/专有名词可保留英文”和“整句未翻译”；
+- 质量门失败时保留已有缓存并明确报错，不要静默输出半成品。
+
+P1-3　翻译重试是“有界地卡死”，且没有输出上限
+
+# plugins.v2/subtitlehunter/translate_ops.py:270-303
+attempts = self._api_retries + 1          # 默认 11 次
+...
+delay = min(300, max(1, 5 * (2 ** min(attempt, 6))))
+
+默认 api_retries=10，单阶段最坏等待：
+
+5 + 10 + 20 + 40 + 80 + 160 + 300 + 300 + 300 + 300 = 1515 秒 ≈ 25 分钟
+
+quality 模式每批 3 个阶段（literal → reflect → polish），单批最坏 75 分钟。5 个并发批次里只要有一个模型持续 400/解析失败，整个任务就会卡很久。README 把“失败有界”写成优点，但这不是有界，这是有界地卡死。
+
+更严重的是重试不区分错误类型：
+
+401/403（Key 错）→ 重试 11 次；
+
+400（context too long / temperature unsupported）→ 重试 11 次；
+
+JSON 解析失败（模型输出被截断）→ 用同样的 prompt、同样的 batch 再试 11 次；
+
+只有 429/5xx/超时才值得重试。
+
+同时 _chat_completion 没有设置 max_tokens：
+
+# plugins.v2/subtitlehunter/translate_ops.py:450-455
+body = {
+    "model": ai_config.get("model"),
+    "messages": messages,
+    "temperature": 0.2,
+}
+
+默认 60 条/9000 字符的批次，输出 JSON 很可能超过网关默认的 4k output cap，被截断 → 缺 index → 触发“缺少字幕索引”异常 → 重试同一个过大的请求 → 再次截断。这是一个自我强化的失败循环。
+
+修法：
+- 只对 429/5xx/超时/连接错误重试；4xx（除 429）立即失败；
+- 尊重 Retry-After；指数退避加 jitter；单批总重试时间封顶（如 3 分钟）；
+- 设置 max_tokens，按 token（而非字符）估算批次；
+- 连续两次“缺 index / 输出截断”时，把批次二分递归重试，直到 1 条；这比重复同一个请求有效得多；
+- 失败批次标记为失败并继续其他批次，输出“部分完成 + 明确失败列表”，不要阻塞整片。
+
+P1-4　“复用系统智能助手”并没有真正复用
+
+# plugins.v2/subtitlehunter/translate_ops.py:808-817
+if self._model_source == "system":
+    config = {
+        "provider": getattr(settings, "LLM_PROVIDER", None) or "openai",
+        "model": getattr(settings, "LLM_MODEL", None),
+        "api_key": getattr(settings, "LLM_API_KEY", None),
+        "base_url": getattr(settings, "LLM_BASE_URL", None),
+        ...
+    }
+
+问题有两层：
+
+读错了配置源。v3 的运行时配置通过 get_runtime_setting() / runtime provider 读取，settings 可能只是环境变量/默认值。用户在 UI 里改的智能助手模型、Key、Base URL，插件可能读不到。
+
+只支持 OpenAI 兼容的 /chat/completions。系统智能助手可以是 Gemini 原生、Claude 原生、Azure OpenAI、Ollama 等，路径、鉴权、请求体都不同。_chat_completion 直接拼 {base_url}/chat/completions，对非 OpenAI 兼容 provider 必然失败。
+
+README 说“默认复用 MoviePilot 系统智能助手配置”，这个承诺目前只在“系统助手恰好是 OpenAI 兼容 + 恰好写在 settings 里”时成立。
+
+修法：抽一个 TranslationProvider 协议：
+- SystemLLMProvider：走 MoviePilot 的 LLMHelper / get_runtime_setting，由宿主处理 provider 差异；
+- OpenAICompatProvider：保留现有直连，用于自定义网关；
+- MockProvider：测试用。
+
+这样“系统助手”才是真的复用，而不是自己猜配置。
+
+P1-5　非 UTF-8 字幕会被静默损坏
+
+# plugins.v2/subtitlehunter/translate_ops.py:38
+content = source_path.read_text(encoding="utf-8-sig", errors="ignore")
+
+errors="ignore" 会把 GBK、CP1252、UTF-16 的字节直接丢掉。结果不是报错，而是“解析出一些乱码条目/空条目”，翻译质量崩坏，甚至 parse_srt 返回 0 条。
+
+同样的问题出现在：
+
+_subtitle_file_has_chinese_text（media_ops.py:26）
+
+_estimate_scan_subtitle_chars（workflow.py:653）
+
+修法：用 charset-normalizer / chardet 检测；按 utf-8-sig → utf-16 → gb18030 → cp1252 回退；全部失败时明确报错，不要 errors="ignore"。加一组 GBK/UTF-16 的黄金文件。
+
+P1-6　季包入库只处理第一集
+
+on_transfer_complete 对每个 transfer.complete 都尝试启动任务，而 _start_background_job 是“有任务就拒绝”：
+
+# plugins.v2/subtitlehunter/runtime_ops.py:61-64
+with self._status_lock:
+    if self._job_active:
+        logger.warning("已有字幕任务正在运行，跳过")
+        return False
+    self._job_active = True
+
+季包（10 集）入库时，事件几乎同时到达：第 1 集启动，第 2–10 集全部被拒绝。如果用户没有配置定时任务，后面 9 集永远不会被处理。
+
+修法：按目标目录做 debounce（30–60 秒），维护 pending 集合，合并成一个目录级任务；或者做一个队列，_job_active 只表示“消费者在跑”，新事件入队而不是丢弃。
+
+P1-7　后台任务锁是进程内的，重载/多 worker 会双跑
+
+_job_active 是实例属性，stop_service 只设置 cancel event，不 join 线程。插件热重载后：
+
+旧线程可能还在跑（daemon，不会被杀）；
+
+新实例 _job_active=False，认为空闲；
+
+两个线程同时处理同一个视频，重复调用 LLM、重复写同一个输出文件。
+
+MoviePilot 多 worker 部署时，不同进程更是各自为政。os.replace 保证不会写坏文件，但保证不了不重复烧钱。
+
+修法：文件锁（fcntl.flock）按“目标目录/视频路径”加锁；锁文件放在插件数据目录；跨进程有效。stop_service 里 join 一个短超时，至少记录“旧任务未退出”。
+
+P1-8　HTTP API 接受任意路径，存在越权读写风险
+
+# plugins.v2/subtitlehunter/workflow.py:76-140
+def api_list_subtitles(self, path: str = ""):
+    target_paths = self._split_target_paths(path or self._target_path)
+    ...
+def api_ensure_chinese(self, payload=None):
+    target_path = payload.get("path") or self._target_path
+    ...
+def api_extract_subtitles(self, payload=None):
+    video_path = self._resolve_target_path(payload.get("path") or "")
+
+path 完全没有限制：可以是 /etc、../../、符号链接指向的任意目录。/ensure 还会在目标目录写字幕文件。虽然 API 需要 MoviePilot 的 apikey，但：
+
+多用户/多租户部署里，apikey 可能被共享；
+
+一旦 apikey 泄露，攻击者可以枚举文件系统、写任意目录；
+
+路径穿越是最基础的 Web 安全问题。
+
+修法：维护允许根目录列表（target_path 配置的根 + 媒体库根）；Path.resolve() 后 is_relative_to(root)；拒绝符号链接逃逸；对 .. 显式拒绝；API 返回 400 而不是静默处理。
+
+P1-9　__request_json 把 4xx/5xx 全部当成“无响应”
+
+# plugins.v2/prowlarrextend/__init__.py:318-331
+ret = RequestUtils(...).get_res(api_url)
+if not ret:
+    return None
+if getattr(ret, "status_code", 200) >= 400:
+    return None
+
+requests.Response.__bool__ 在 status_code >= 400 时返回 False（实测 401/404/500 均为 False）。所以第二个 status_code >= 400 分支永远走不到：
+
+401（Key 错）→ “Prowlarr 无响应”；
+
+404（地址错）→ “Prowlarr 无响应”；
+
+429（限流）→ “Prowlarr 无响应”；
+
+500（Prowlarr 内部错）→ “Prowlarr 无响应”。
+
+用户拿到的诊断信息是错的，排查方向也会错。
+
+修法：先判 ret is None，再判 status_code；把 401/403/404/429/5xx 分别映射成明确的错误信息；不要在 __request_json 里吞掉状态码。
+
+P1-10　test_connection 有副作用，会改写同步状态
+
+# plugins.v2/prowlarrextend/__init__.py:255
+indexers = self.get_indexers()
+
+get_indexers() 不是只读：
+
+# plugins.v2/prowlarrextend/__init__.py:333-342
+def get_indexers(self):
+    self._indexers_authoritative = False
+    indexers = self.__get_indexers_from_config()
+    if indexers is not None:
+        self._indexers_authoritative = True
+        return self.__apply_indexer_selection(indexers)
+    ...
+
+一个“测试连接”的 GET 接口，会重置 _indexers_authoritative、刷新 _indexer_catalog、改变多选过滤结果。并发时可能让正在进行的 sync_indexers 看到错误的 authoritative 状态，从而跳过/执行站点清理。
+
+修法：/test 只做 GET /api/v1/system/status + GET /api/v1/indexer 的只读探测，返回数量和版本；不要调用 get_indexers()，不要碰任何实例状态。需要刷新就单独提供 /refresh。
+
+P1-11　插件强行改写 SystemConfigKey.IndexerSites
+
+# plugins.v2/prowlarrextend/__init__.py:840-861
+selected_sites = self.systemconfig.get(SystemConfigKey.IndexerSites) or []
+...
+self.systemconfig.set(SystemConfigKey.IndexerSites, cleaned_sites + missing_ids)
+
+这带来三个问题：
+
+用户无法取消单个桥接站点的搜索。用户在 MoviePilot 设置里去掉一个站点，下次同步插件会把它加回来；唯一控制入口变成插件的 selected_indexers。
+
+全局副作用。一个插件改写宿主的全局搜索范围，会触发 SiteUpdated、配置变更事件，可能和其他插件形成循环。
+
+“空表示全部”的语义被破坏。如果 IndexerSites 为空表示“全部站点”，插件直接 return，行为又不一样。
+
+修法：不要碰 IndexerSites。桥接范围由插件自己的 selected_indexers 决定；如果用户想在 MoviePilot 里按站点过滤，应该在插件结果里带上 site_name，让宿主 UI 去筛。
+
+P1-12　假站点污染 Site 表，且无法通过健康检查
+
+# plugins.v2/prowlarrextend/__init__.py:768-783
+payload = {
+    "name": indexer.get("name"),
+    "domain": domain,                 # prowlarr-15.extend
+    "url": f"https://{domain}/",     # 不存在的域名
+    "is_active": True,
+    ...
+}
+
+MoviePilot 的站点表不只有“搜索”一个用途：站点连通性检测、RSS、签到、用户数据、做种检查、下载器路径映射都可能遍历它。一个 https://prowlarr-15.extend/ 的站点：
+
+DNS 不解析；
+
+健康检查必然失败；
+
+站点列表里出现一堆用户不认识的“站点”；
+
+每次同步都发 SiteUpdated 事件。
+
+插件用 search.paths=[] 让系统蜘蛛“尽早放弃”，但这只是让搜索跳过，其他子系统不一定买账。
+
+修法：v3 架构下彻底删除假站点；如果为了 v2 兼容保留，至少 is_active=False、note.managed_by 标记、并在健康检查/统计里排除。
+
+4. P2：架构与可维护性
+
+4.1 度量数据
+
+文件
+行数
+函数数
+备注
+
+prowlarrextend/__init__.py
+1211
+43
+get_form 212 行，search_torrents 圈复杂度 33
+
+subtitlehunter/ui.py
+520
+3
+get_form 367 行
+
+subtitlehunter/translate_ops.py
+846
+41
+_translate_cues 76 行，_translate_batch 71 行
+
+subtitlehunter/workflow.py
+669
+23
+_ensure_chinese_workflow 141 行，_select_english_source 圈复杂度 37
+
+subtitlehunter/runtime_ops.py
+509
+30
+运行时状态 + 通知 + 锁 + 取消混在一起
+
+Radon 平均复杂度 B (5.83)，高复杂度函数：
+
+ProwlarrExtend.search_torrents — E (33)
+
+WorkflowMixin._select_english_source — E (37)
+
+WorkflowMixin._ensure_video_chinese — E (35)
+
+WorkflowMixin._ensure_chinese_workflow — D (30)
+
+ProwlarrExtend.__sync_site_records — D (27)
+
+这不是“风格问题”，是修改成本与回归风险：每加一个索引器字段、每加一种字幕格式，都要在 100+ 行的分支里找位置。
+
+4.2 虚拟站点是“架构谎言”
+
+这个插件最核心的设计是：把每个 Prowlarr 索引器伪装成 MoviePilot 的一个站点。为了让这个谎言成立，代码里出现了一整套补丁：
+
+prowlarr_domain_suffix = "extend"、prowlarr-15.extend 假域名；
+
+search.paths=[] 让系统蜘蛛放弃；
+
+_is_managed_site() 按 domain/name/parser 三重判断；
+
+__get_indexer_id() 从 domain、id、url 四种来源猜 ID；
+
+残留站点跳过、catalog 清空、legacy domain 清理；
+
+SiteUpdated 事件、SystemConfigKey.IndexerSites 同步。
+
+这些补丁本身写得很认真，但它们在解决一个本来不该存在的问题。正确的边界是：
+
+Prowlarr 是一个外部搜索提供者；MoviePilot 的 plugin source 是官方扩展点。把 Prowlarr 建模成“搜索提供者”，而不是“站点”。
+
+一旦改成 plugin source：
+
+不需要假域名；
+
+不需要 SitesHelper.add_indexer；
+
+不需要 Site CRUD；
+
+不需要 IndexerSites；
+
+不需要 __get_indexer_id 猜谜；
+
+不需要残留站点清理；
+
+v3 兼容问题自然消失。
+
+这不是“重构”，是删掉一半代码。
+
+4.3 Mixin 不是模块化，是分布式上帝类
+
+SubtitleHunter 由 5 个 mixin + _PluginBase 组成：
+
+class SubtitleHunter(
+    MediaOpsMixin,
+    TranslateOpsMixin,
+    WorkflowMixin,
+    RuntimeOpsMixin,
+    UIMixin,
+    _PluginBase,
+):
+
+它们共享 self._runtime、self._job_active、self._cancel_event、self._api_*、self._target_path 等几十个属性。任何 mixin 都可以读写任何状态，没有接口、没有边界、没有依赖声明。
+
+这不是“拆开了上帝类”，而是把上帝类拆成 5 个互相偷看私有状态的类。MRO 还成了 bug 来源：v2.18 的版本记录就是“修复 mixin MRO，确保 get_form/get_page/stop_service 可加载”。用继承顺序来保证方法解析，是脆弱的。
+
+修法：组合优于继承。SubtitleHunter 只持有 JobRunner、Translator、MediaRepository、Notifier；每个组件通过构造函数拿依赖，通过 dataclass 传状态。
+
+4.4 状态机是字符串
+
+"未运行" / "运行中" / "完成" / "部分失败" / "已取消" / "已跳过" / "配置错误" / "失败" / "已有中文" / "已生成中文" 散落在 workflow.py、runtime_ops.py、ui.py、codes.py。
+
+拼错一个字符串，UI 颜色就错；
+
+新增状态要改 4 个文件；
+
+map_error_message 用中文子串匹配错误类型（"取消" in message、"AI" in text），换个措辞就失效；
+
+FailureCode 已经有 Enum，但没有贯穿到状态机。
+
+修法：JobStatus(str, Enum) + CueStatus(str, Enum) + FailureCode；所有赋值/比较走 Enum；UI 用映射表；错误分类在抛出点决定，不要靠事后字符串猜。
+
+4.5 配置默认值有三份，迁移是临时的
+
+默认值同时存在于：
+
+init_plugin（__init__.py:50-79）
+
+_current_config（__init__.py:212-242）
+
+ui.get_form 的返回值（ui.py:373，实际调用 _current_config）
+
+加一个字段要改 3 处；漏一处就出现“表单显示 A、运行时用 B”。
+
+迁移逻辑也是临时的：
+
+# subtitlehunter/__init__.py:101-104
+self._api_retries = self._safe_int(config.get("api_retries"), 10, 0, 100)
+if self._api_retries < 10:
+    self._api_retries = 10
+    config_changed = True
+
+用户故意设 3（本地小模型、无 rate limit）也会被强制改成 10。表单还把 api_retries 隐藏了，用户无法改回。
+
+修法：@dataclass(frozen=True) PluginConfig + from_raw() + to_dict()；一份默认值；版本化迁移（config_version）；迁移只做一次，不做“每次加载都强制”。
+
+4.6 get_form 是手写 JSON 的泥石流
+
+ProwlarrExtend.get_form 212 行，SubtitleHunter.get_form 367 行，全是嵌套 dict：
+
+{'component': 'VRow', 'content': [
+    {'component': 'VCol', 'props': {'cols': 12, 'md': 4}, 'content': [
+        {'component': 'VSwitch', 'props': {'model': 'enabled', 'label': '启用插件'}}
+    ]}
+]}
+
+没有 builder、没有 schema、没有布局复用。改一个字段要数括号；测试只能靠 find_select 递归查找（test_prowlarrextend.py:568-589）。
+
+修法：ui/builders.py：row(*cols)、col(md=4, *children)、switch(model, label)、text_field(...)。同样的 dict 输出，代码量降到 1/4，可读性和可测试性都上来。
+
+4.7 异常处理：31 处 blind except，另有 3 处静默 pass/continue
+
+ruff --select BLE001 报了 31 处 except Exception，另有 3 处 S110/S112（try-except-pass / try-except-continue）。有些是合理的边界兜底（插件不能崩宿主），但很多是把“可诊断的错误”变成“静默降级”：
+
+__request_json 吞掉 JSON 解析错误；
+
+_load_runtime_state 吞掉状态损坏；
+
+_save_runtime_state 吞掉写盘错误；
+
+_cleanup_translation_cache 吞掉 stat/unlink 错误；
+
+_translate_stage 对任何异常重试 11 次。
+
+修法：定义 ProwlarrError / TranslationError 层级；只在边界（插件入口、任务线程）兜底；兜底时记录 type(e).__name__ + 上下文；不要用 except Exception: pass。
+
+4.8 可观测性：日志有，但没有关联 ID
+
+日志都是 【ProwlarrExtend】... / 【SubtitleHunter】...，没有 job_id、video_id、batch_id。多目标/多批次并发时，日志交错，无法回答“这个视频的翻译为什么失败”。
+
+SubtitleHunter 有 stage_timings，但只存在内存/状态 JSON 里，没有结构化输出；ProwlarrExtend 没有阶段耗时。
+
+修法：每个任务生成 job_id，日志统一 job_id=... video=... stage=...；关键阶段记录耗时、重试次数、token 用量；状态 JSON 加 schema_version。
+
+4.9 Prowlarr API Key 可能进入日志/下载历史
+
+这不是插件的错，但插件是链路的一环。Prowlarr 的 DownloadMappingService 把下载链接构造成：
+
+// Prowlarr src/NzbDrone.Core/Download/DownloadMappingService.cs:40
+var proxyLink = $"{serverUrl}{urlBase}/{indexerId}/download?apikey={_configFileProvider.ApiKey}&link={encodedLink}&file={urlEncodedFile}";
+
+也就是说，TorrentInfo.enclosure 里天然带着 Prowlarr 的 API Key。插件把它原样放进 TorrentInfo，MoviePilot 可能把它写进下载历史、日志、通知或错误信息。
+
+修法：插件不要在日志里打印完整 enclosure；错误信息里把 apikey=... 替换成 apikey=***；如果 MoviePilot 的下载历史会持久化 enclosure，在 README 里提醒用户这是 Prowlarr 的设计，并建议使用独立的 Prowlarr API Key / 反代白名单。
+
+5. 测试与 CI 的真实水平
+
+5.1 做得好的地方
+
+54 个测试，0.34 秒跑完，迭代反馈快；
+
+纯函数（mapping/selection/formats/quality/eta/batching/linecheck）有直接覆盖；
+
+版本契约测试（plugin_version vs package.v2.json）；
+
+原子写入、重试有界、取消、缓存清理、MRO 都有用例；
+
+fixture 覆盖了 Prowlarr indexer 的禁用/非 Torrent/无名字段。
+
+5.2 致命问题：测试定义了自己要验证的宿主
+
+tests/conftest.py 做了这些事：
+
+_install_module("app", ...)
+_install_module("app.helper.sites", SitesHelper=type("SitesHelper", (), {
+    "get_indexer": lambda self, domain: None,
+    "add_indexer": lambda self, domain, value: None,
+}))
+_install_module("app.db.models.site", Site=type("Site", (), {}))
+_install_module("app.plugins", _PluginBase=_PluginBase)   # 自己写的简化基类
+_install_module("app.utils.http", RequestUtils=RequestUtils)  # get_res 永远返回 None
+_install_module("app.log", logger=_Logger())              # 所有日志吞掉
+
+这意味着：
+
+宿主删掉 add_indexer，测试不会红，因为替身有；
+
+宿主把 Site 改成必须传 session，测试不会红，因为测试里的 Site 是 type("Site", (), {})，具体用例再 monkeypatch 一个接受 None 的假类；
+
+宿主把搜索链改成 site={}，测试不会红，因为测试直接调 plugin.search_torrents(site={...})，从来没有模拟 v3 的调用方式；
+
+宿主把 LLM_* 改成 runtime setting，测试不会红，因为 settings 是 SimpleNamespace；
+
+宿主把 NotificationType 改名，测试不会红，因为 conftest 自己定义了 NotificationType。
+
+测试覆盖的是“实现细节 + 自建宿主”，不是“插件与宿主的契约”。 这就是为什么 54 个绿灯和“v3 完全不能用”可以同时成立。
+
+5.3 缺失的测试类型
+
+类型
+现状
+应有
+
+宿主契约测试
+无
+用真实 MoviePilot（pinned）导入 _PluginBase/SitesHelper/Site/搜索链，断言方法存在、签名匹配、调用方式匹配
+
+HTTP 集成测试
+无（RequestUtils 永远返回 None）
+pytest-httpserver/responses 假 Prowlarr：401/429/500/超时/坏 JSON/分页/选择/去重
+
+黄金字幕测试
+无
+20+ 真实 SRT/ASS（UTF-8/GBK/UTF-16、1 位小时、2 位毫秒、样式、多行、双语）
+
+属性测试
+无
+Hypothesis：parse(render(cues)) == cues，不丢条、不乱序
+
+并发测试
+弱
+两个 sync_indexers 同时跑；两个任务同时启动；取消与重试竞争
+
+数据库测试
+无（全 mock）
+如果保留 Site 写入，用真 SQLite session；否则删掉这条路径
+
+端到端测试
+无
+真 MoviePilot 容器 + 假 Prowlarr + 假 LLM，跑一遍搜索/字幕
+
+5.4 几个具体弱测试
+
+test_background_job_admission_is_atomic（test_subtitlehunter.py:36-58）：名字说 atomic，实际是“启动第一个 → 等它起来 → 启动第二个”，没有并发竞争。锁是对的，但测试没有证明。
+
+test_chunk_cues_prefers_sentence_boundary（:322-344）：断言 len(chunk) <= 2，但实际算法在 batch_chars=8 时把 4 条切成 4 个单条；测试的注释和断言都比实际行为弱。
+
+test_search_timeout_survives_form_defaults（test_prowlarrextend.py:278-288）：断言 defaults["search_timeout"] == 30，而插件配置是 60；这其实在测试“表单默认值不是当前值”，语义容易误导。
+
+test_eta_does_not_multiply_total_chars_by_video_count（:220-230）：把“10 个视频和 1 个视频耗时相同”固化成期望；如果 total_chars 的语义变成“每个视频的字幕量”，这个测试会阻止正确修复。
+
+5.5 CI 不可复现
+
+CI 只有 27 行：
+
+- run: python -m pip install pytest ruff
+- run: ruff check plugins.v2/ tests/
+- run: python -m pytest tests/ -q
+
+没有 pyproject.toml、没有 ruff.toml、没有 pin 版本、没有 matrix、没有 coverage、没有类型检查。
+
+同一份代码：
+
+2026-08 的 ruff（默认规则较窄）→ 绿；
+
+2026-10 的 ruff 0.17.1（默认规则大幅扩展）→ 380 条（UP006 214、UP045 52、UP035 37、BLE001 31、UP009 19…）；
+
+显式 --select E4,E7,E9,F → 0 条。
+
+也就是说：CI 的绿灯依赖于“当时安装到的 ruff 版本”，不是代码质量。 今天重新跑 CI 会红，但红的不是 bug，是规则集变了；反过来，真正该管的 BLE001（blind except）在 CI 里根本不开。
+
+修法：pyproject.toml 固定 target-version=py311、line-length=120、[tool.ruff.lint] select = ["E","F","I","B","UP","SIM","BLE","S"]；CI pin ruff==0.17.1、pytest==8.x；加 ruff format --check；加 pytest --cov（先设 60%，逐步提高）；加 Python 3.11/3.12/3.13 matrix。
+
+5.6 发布流程：没有 release，等于没有回滚
+
+README 说“重启容器时会从 GitHub 拉最新代码”。这意味着：
+
+main 的每个 commit 都是生产版本；
+
+没有 tag、没有 release notes、没有 rollback；
+
+一个坏 commit 会让所有用户同时坏；
+
+用户无法说“我锁定在 v2.12”。
+
+对一个公开插件，这是供应链风险，不是“方便”。
+
+修法：main 保持稳定；开发在 dev；每次发布打 tag（v3.0.0）；package.v2.json 的 version 与 tag 对齐；提供 COMPATIBILITY.md（插件版本 × MoviePilot 版本 × 测试日期）；README 给出“锁定版本”的方法。
+
+6. 文档的可信度问题
+
+文档多是优点，但有几处会误导维护者：
+
+PLAN.md 的目标 v2.14.0 是真实版本（2026-06-30），插件也确实按它写的，这一点没问题。问题是：v2.14.0 之后宿主进入了 v3（v3.0.0 于 2026-09-12），而 README 仍然只写“MoviePilot V2”，没有兼容矩阵，也没有“v3 不支持”的提示。目标版本选对了，但生命周期没跟上。
+
+MAINTENANCE.md 的风险表把 SitesHelper.add_indexer 标为“低风险”，理由是“官方 customindexer 插件也在用”。在 v2.14.0 时代这是合理的；但 v3 的公开接口里已经没有它，风险表没有更新。风险表不是一次性文档，宿主大版本升级时必须重写。
+
+README 说“复用 MoviePilot 系统智能助手配置”。实际读的是 settings.LLM_*，且只支持 OpenAI 兼容 /chat/completions；v3 的 runtime setting 可能读不到，Gemini/Claude 原生会失败。
+
+README 说“失败有界……不会永久占住后台任务”。技术上没错，但 11 次重试 × 最长 5 分钟 × 3 阶段，单批最坏 75 分钟；这不是用户理解的“有界”。
+
+README 说“代理禁用修复”。proxies={"http": None, "https": None} 依赖 requests 的 None 覆盖语义，建议改成 Session.trust_env = False，更明确。
+
+版本历史顺序混乱：README 的 SubtitleHunter 历史从 v2.19 跳到 v2.4，再 v2.5…v2.18；读者无法判断时间线。
+
+CLAUDE.md 说“SitesHelper 是 .so 编译文件，无法直接阅读源码，只能通过官方插件用法推断接口”。这句话本身就承认了最大的风险：核心接口靠推断。正确做法是查 .pyi / 官方源码 / 契约测试，而不是“推断”。
+
+7. 重构方案
+
+7.1 目标与原则
+
+只使用宿主公开、稳定的扩展点：get_module() 的 plugin source、get_service()、get_api()、get_form()/get_page()；不碰 SitesHelper.add_indexer、不写 Site 表、不改全局 IndexerSites。
+
+v3-first，v2 兼容可选：先保证 v3.1.9 可用；v2 用能力检测做降级，不把双路径写死。
+
+不可变快照 + 单飞刷新：索引器列表是一个 immutable snapshot；刷新是 single-flight；搜索只读快照，不加锁。
+
+组合优于继承：删掉 mixin，改成 JobRunner / Translator / MediaRepository / Notifier 组合。
+
+错误分类，不吞异常：边界兜底，内部抛类型化异常；重试只针对可重试错误。
+
+测试契约，不测试替身：真实宿主（pinned）+ 假 Prowlarr + 黄金字幕 + 属性测试。
+
+7.2 ProwlarrExtend 目标架构
+
+plugins.v2/prowlarrextend/
+├── __init__.py          # 插件壳：配置、get_module、get_api、get_service
+├── config.py            # PluginConfig dataclass + from_raw + migrate
+├── client.py            # ProwlarrClient：HTTP、鉴权、超时、错误映射
+├── models.py            # Indexer / Release / SearchQuery / SearchPage
+├── registry.py          # IndexerRegistry：快照、单飞刷新、选择过滤
+├── search.py            # SearchService：扇出、并发、去重、映射
+├── mapping.py           # TorrentInfo 字段映射（保留）
+├── errors.py            # ProwlarrError 层级 + classify
+└── ui.py                # form/page builders
+
+核心接口（示意）：
+
+@dataclass(frozen=True)
+class PluginConfig:
+    enabled: bool
+    host: str
+    api_key: str
+    proxy: bool
+    search_timeout: int
+    selected_ids: tuple[str, ...]
+    max_concurrency: int = 6
+    circuit_breaker_seconds: int = 300
+
+    @classmethod
+    def from_raw(cls, raw: dict) -> "PluginConfig": ...
+
+class ProwlarrClient:
+    def __init__(self, config: PluginConfig, http: HttpClient): ...
+    def system_status(self) -> dict: ...
+    def list_indexers(self) -> list[Indexer]: ...
+    def search(self, indexer_id: str, query: SearchQuery) -> SearchPage: ...
+
+class IndexerRegistry:
+    def __init__(self, client: ProwlarrClient, config: PluginConfig): ...
+    def snapshot(self) -> tuple[Indexer, ...]: ...   # 只读，无锁
+    def refresh(self) -> RefreshResult: ...          # single-flight
+
+search_torrents 的双模式（v2 + v3）：
+
+def search_torrents(self, site, keyword, mtype=None, page=0):
+    if not keyword:
+        return []
+    indexers = self._registry.snapshot()
+    if site:
+        indexer_id = self._resolve_indexer_id(site)
+        if not indexer_id:
+            return []
+        indexers = tuple(i for i in indexers if i.id == indexer_id)
+    if not indexers:
+        return []
+    return self._search_service.search(indexers, keyword, mtype, page)
+
+v3：site={} → 扇出全部选中索引器 → 合并结果，site_name 填索引器名。
+
+v2：site 是虚拟站点 → 只搜该索引器（保留旧行为，作为过渡）。
+
+真实站点：_resolve_indexer_id 返回空 → 返回 []，不接管。
+
+删除清单：
+
+SitesHelper.add_indexer 及 __sync_helper_indexers
+
+Site.get_by_domain/create/update/delete 及 __sync_site_records
+
+prowlarr_domain_suffix、__build_domain、__legacy_domain、__is_managed_domain
+
+__get_managed_site_records
+
+__sync_search_sites / SystemConfigKey.IndexerSites 写入
+
+__get_indexer_id 的四路猜谜（改为 Indexer.id 一字段）
+
+search.paths=[] 的蜘蛛规避 hack
+
+SiteUpdated 事件
+
+test_connection 里的 get_indexers() 调用
+
+保留清单：
+
+mapping.py 的字段映射（加 tmdbid/tvdbid 如宿主需要）
+
+selection.py 的纯函数（改成 PluginConfig.selected_ids）
+
+search_http.py 的错误提取（并入 errors.py）
+
+连接测试 /test、状态 /status
+
+多选 UI、详情页
+
+7.3 SubtitleHunter 目标架构
+
+plugins.v2/subtitlehunter/
+├── __init__.py          # 插件壳：配置、get_api、get_service、事件注册
+├── config.py            # PluginConfig + migrate
+├── domain.py            # SubtitleCue / SubtitleTrack / JobStatus / StageResult
+├── repository.py        # 媒体发现、编码检测、原子读写、路径安全
+├── probe.py             # ffprobe/ffmpeg 封装（超时、UTF-8、错误分类）
+├── pipeline.py          # discover -> probe -> decide -> extract -> translate -> validate -> write
+├── decide.py            # 纯决策：是否需要翻译、选哪个源、是否已有中文
+├── translate/
+│   ├── provider.py      # TranslationProvider 协议 + SystemLLM/OpenAICompat/Mock
+│   ├── prompts.py       # prompt 构建
+│   ├── cache.py         # 翻译缓存
+│   ├── retry.py         # 重试策略（分类、退避、jitter、封顶）
+│   ├── batching.py      # 按 token/字符/句边界分批 + 失败二分
+│   └── quality.py       # 覆盖率、逐条校验、行长/CPS
+├── subtitles/
+│   ├── srt.py           # 宽容解析 + 渲染
+│   ├── ass.py           # 解析 + 样式保留
+│   └── tags.py          # 标签掩码/还原
+├── notify.py            # 通知模板
+└── ui.py                # form/page builders
+
+TranslationProvider 协议：
+
+class TranslationProvider(Protocol):
+    def translate(self, items: list[CueText], ctx: TranslationContext) -> dict[int, str]: ...
+    def health(self) -> ProviderHealth: ...
+
+class SystemLLMProvider:
+    """走 MoviePilot LLMHelper / get_runtime_setting，支持任意 provider。"""
+
+class OpenAICompatProvider:
+    """自定义 OpenAI 兼容网关，保留现有能力。"""
+
+关键修复点：
+
+重试分类：Retryable = RateLimited | ServerError | Timeout | ConnectionError；AuthError | BadRequest | ContentPolicy 立即失败。
+
+批次二分：MissingIndices / OutputTruncated → split(batch) 递归，直到 1 条；单条仍失败才标记失败。
+
+token 预算：按模型上下文估算输入+输出 token；max_tokens 显式设置；超过预算先拆批。
+
+样式保留：SubtitleCue 增加 style_prefix/style_suffix；翻译只处理 plain_text；渲染时拼回。
+
+编码检测：charset-normalizer，回退 utf-8-sig → utf-16 → gb18030 → cp1252；失败明确报错。
+
+forced 检测：只匹配语言标签后的 forced/foreign 后缀；删除 only/signs。
+
+语言映射：pycountry 或完整 639-2/639-1 表；输出 ja/fr/de/es 等 Jellyfin 友好标签。
+
+质量门：覆盖率 0.9 + 逐条检查 + 长英文行检测。
+
+季包：按目录 debounce 30–60 秒，pending 集合合并；或队列消费。
+
+跨进程锁：fcntl.flock 按目标目录；stop_service join 短超时。
+
+路径安全：允许根列表 + resolve() + is_relative_to。
+
+7.4 迁移阶段
+
+阶段
+时间
+交付物
+验收标准
+风险
+
+0. 安全网
+2–3 天
+v3 契约测试（预期红）、假 Prowlarr HTTP 测试、20 个黄金字幕、COMPATIBILITY.md、v2 用户维护 tag
+契约测试能复现 v3 断裂；黄金字幕覆盖 GBK/UTF-16/ASS 样式
+低
+
+1. ProwlarrExtend v3
+4–5 天
+client/registry/search/config/ui 新模块；双模式 search_torrents；删除 Site/SitesHelper/IndexerSites 写入
+v3.1.9 上 search_plugin_torrents 返回结果；不创建 Site 行；401/429/超时映射正确；10 索引器搜索有总超时
+中：需要真机验证
+
+2. SubtitleHunter 正确性
+4–5 天
+编码检测、SRT/ASS 宽容解析、样式保留、forced、语言映射、覆盖率
+黄金集 round-trip 不丢条；Signs.2002 不误判；50% 英文被拒；{\an8} 保留
+低
+
+3. 翻译引擎
+5–7 天
+Provider 协议、SystemLLM、重试分类、token 预算、批次二分、季包 debounce、跨进程锁
+429/超时恢复；400 快速失败；截断自动拆批；季包 10 集一次任务；双 worker 只跑一个
+中
+
+4. 工程化
+2–3 天
+pyproject.toml、ruff pin、CI matrix、coverage、tag/release、changelog
+CI 可复现；ruff check 0；tag 可安装；README 有兼容矩阵
+低
+
+总计：4–5 周全职；业余维护约 8–10 周。
+
+7.5 如果只有两个周末
+
+周末 1：让 v3 能用
+
+只做 P0-1：search_torrents 支持 site={} 扇出；删除 SitesHelper.add_indexer/Site 写入；search_plugin_torrents 能返回结果。
+
+README 顶部加 banner：“v3 用户请使用 v3.0.0；v2 用户请锁定 v2.12-v2”。
+
+这一步不需要完美架构，只需要恢复功能。
+
+周末 2：让结果对
+
+修 SRT_TIME（1–2 位小时、1–3 位毫秒、./,）。
+
+修 FORCED_PATTERNS（删除 only|signs，锚定语言后缀）。
+
+覆盖率阈值 0.5 → 0.9 + 逐条检查。
+
+ASS 标签掩码/还原。
+
+加 10 个黄金字幕测试。
+
+其余（重试、token、编码、季包、锁、架构）排到后续。
+
+8. 优先级矩阵
+
+优先级
+事项
+影响
+工作量
+建议
+
+P0
+v3 plugin source 迁移
+插件能否工作
+4–5 天
+立刻
+
+P0
+SRT/ASS 解析与样式
+输出是否正确
+3–4 天
+立刻
+
+P1
+forced 误判 + 覆盖率
+是否翻译/质量门
+1–2 天
+本周
+
+P1
+重试分类 + max_tokens + 批次二分
+稳定性/成本
+3–4 天
+2 周内
+
+P1
+系统 LLM provider 抽象
+“复用助手”是否成立
+2–3 天
+2 周内
+
+P1
+编码检测
+非 UTF-8 字幕
+1 天
+2 周内
+
+P1
+季包 debounce + 跨进程锁
+漏集/双跑
+2–3 天
+3 周内
+
+P1
+API 路径 allowlist
+安全
+1 天
+3 周内
+
+P2
+拆分上帝类/去 mixin
+可维护性
+1–2 周
+1–2 月
+
+P2
+UI builder
+可维护性
+2–3 天
+1 月内
+
+P2
+测试/CI/发布流程
+长期质量
+3–5 天
+持续
+
+9. 结论
+
+这套代码最值得肯定的地方，是作者知道怎么把逻辑拆成纯函数、怎么写原子文件、怎么做缓存和状态。这些是真正的工程能力。
+
+但它也暴露了一个更根本的问题：把“能跑”当成了“架构正确”。虚拟站点在 v2 上确实能跑，于是所有补丁都围绕这个假设生长；测试用替身把宿主 API 固定住，于是绿灯掩盖了契约漂移；文档把“推断出来的接口”写成了“稳定接口”，于是风险表全是绿色。
+
+v3 的到来只是把这个假设戳破了。即使没有 v3，这套设计也会在以下场景出问题：
+
+用户想取消某个桥接站点的搜索；
+
+用户升级 MoviePilot 后站点表出现一堆假域名；
+
+季包入库只处理第一集；
+
+模型返回被截断，插件重试 11 次后卡死；
+
+字幕是 GBK，翻译出来是乱码；
+
+ASS 字幕翻译后所有定位/样式丢失。
+
+所以，最严苛的评价不是“代码写得丑”，而是：
+
+这是一个“在特定版本上能跑”的插件，不是一个“可以长期维护”的插件。它的聪明用在了绕过宿主模型上，而不是顺应宿主模型上。
+
+最后一句
+
+先把 ProwlarrExtend 从“假站点”改成“搜索提供者”。这不是重构，是把插件从宿主的敌人变成宿主的公民。做完这一步，v3 兼容、Site 表污染、IndexerSites 副作用、假域名、ID 猜谜、残留站点清理，会一起消失。
+
+附录 A：复现命令与关键输出
+
+A.1 单测
+
+python3 -m pytest tests/ -q
+# 54 passed in 0.34s
+
+A.2 Ruff
+
+python3 -m ruff --version
+# ruff 0.17.1
+
+python3 -m ruff check plugins.v2/ tests/
+# Found 380 errors.
+# UP006 214, UP045 52, UP035 37, BLE001 31, UP009 19, I001 6, ...
+
+python3 -m ruff check plugins.v2/ tests/ --select E4,E7,E9,F
+# All checks passed!
+
+A.3 复杂度
+
+python3 -m radon cc plugins.v2 -s -a
+# Average complexity: B (5.83)
+# ProwlarrExtend.search_torrents - E (33)
+# WorkflowMixin._select_english_source - E (37)
+# WorkflowMixin._ensure_video_chinese - E (35)
+
+A.4 FORCED 误判
+
+from subtitlehunter import constants as C
+for name in ["The.Only.Living.Boy.2018.en.srt", "Signs.2002.en.srt",
+             "Foreign.Correspondent.1940.en.srt", "movie.en.forced.srt"]:
+    print(name, bool(C.FORCED_PATTERNS.search(name)))
+
+The.Only.Living.Boy.2018.en.srt True
+Signs.2002.en.srt True
+Foreign.Correspondent.1940.en.srt True
+movie.en.forced.srt True
+
+A.5 50% 覆盖率放行
+
+src = [SubtitleCue(i, "", "", "Hello world") for i in range(1, 5)]
+tr = [SubtitleCue(1, "", "", "你好世界"), SubtitleCue(2, "", "", "你好"),
+      SubtitleCue(3, "", "", "Still English here"), SubtitleCue(4, "", "", "Still English too")]
+print(validate_translated_cues(src, tr))
+# (True, '')
+
+A.6 SRT 变体丢条
+
+'0:00:01,00 --> 0:00:02,00' -> cues: 0
+'00:00:01.5 --> 00:00:02.5' -> cues: 0
+'00:00:01,000 --> 00:00:02,000' -> cues: 1
+
+A.7 ASS 样式丢失
+
+原文：  {\an8}Hello world
+译文：  你好世界
+渲染：  Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,你好世界
+
+A.8 requests.Response 布尔行为
+
+200 bool(resp)= True
+401 bool(resp)= False
+404 bool(resp)= False
+500 bool(resp)= False
+
+附录 B：逐文件问题索引
+
+文件
+主要问题
+优先级
+
+prowlarrextend/__init__.py
+v3 断点、1211 行上帝类、get_form 212 行、search_torrents 复杂度 33、__request_json 吞状态码、test_connection 副作用、IndexerSites 强写、假站点
+P0/P1/P2
+
+prowlarrextend/mapping.py
+基本健康；description=sortTitle 语义不对；缺 tmdbid/tvdbid
+P2
+
+prowlarrextend/selection.py
+基本健康；normalize_selected_indexers 把 prowlarr-3.extend 转成 3 的隐式规则偏魔法
+P2
+
+prowlarrextend/search_http.py
+重复 JSON 解析（classify + parse_response_payload）；错误提取可用
+P2
+
+subtitlehunter/constants.py
+FORCED_PATTERNS 误判、SRT_TIME 过严、覆盖率 0.5
+P0/P1
+
+subtitlehunter/formats.py
+SRT 丢条、ASS 样式丢失、plain_subtitle_text 误删标签
+P0
+
+subtitlehunter/quality.py
+50% 覆盖率、逐条校验只看空值、parse_translation_response 不校验类型
+P1
+
+subtitlehunter/language.py
+只映射中/英，jpn/fre/ger/spa 原样输出，Jellyfin 不友好
+P1
+
+subtitlehunter/media_ops.py
+编码、_find_external_subtitles O(V²)、eager ffprobe、重命名过于激进
+P1/P2
+
+subtitlehunter/workflow.py
+季包只处理第一集、嵌套目标漏统计、API 任意路径、141 行工作流
+P1
+
+subtitlehunter/translate_ops.py
+重试风暴、无 max_tokens、系统 LLM 读错源、编码、缓存清理 O(N)
+P1
+
+subtitlehunter/runtime_ops.py
+进程内锁、固定 tmp、_JobCancelled 嵌套类、_runtime_snapshot 锁内调 AI 配置
+P1/P2
+
+subtitlehunter/ui.py
+367 行 get_form、字符串状态映射
+P2
+
+subtitlehunter/__init__.py
+5 个 mixin + 基类、配置三处默认值、api_retries<10 强制
+P2
+
+tests/conftest.py
+自建宿主替身，无法发现契约漂移
+P0（测试有效性）
+
+.github/workflows/ci.yml
+未 pin 版本、无 lint 配置、无 matrix、无 coverage
+P2
+
+附录 C：参考的 MoviePilot 源码位置
+
+结论
+位置（v3.1.9）
+
+插件只收到 site={}
+app/chain/base.py:659-673
+
+站点搜索只走 system modules
+app/chain/base.py:675-690
+
+搜索链先插件源、后站点
+app/chain/search/provider.py:574、app/chain/search/scan.py:178
+
+SitesHelper 公开接口无 add_indexer
+app/application/site/sites.pyi（grep 无结果）
+
+Site.get_by_domain 必须传真实 session
+app/db/models/site.py:66-70
+
+v2.14.0 的旧路径确实会传 site
+v2.14.0 app/chain/search.py:1815-1824
+
+Prowlarr 下载链接自带 apikey
+Prowlarr src/NzbDrone.Core/Download/DownloadMappingService.cs:40
+
+附录 D：一句话清单（给 commit / issue 用）
+
+[ ] search_torrents 支持 site={}，扇出全部桥接索引器。
+
+[ ] 删除 SitesHelper.add_indexer、Site CRUD、假域名。
+
+[ ] 不再写 SystemConfigKey.IndexerSites。
+
+[ ] __request_json 先判 None 再判 status_code。
+
+[ ] test_connection 改成只读。
+
+[ ] SRT_TIME 接受 1–2 位小时、1–3 位毫秒。
+
+[ ] parse_srt 统计 skipped，超阈值失败。
+
+[ ] ASS/SRT 标签掩码/还原。
+
+[ ] FORCED_PATTERNS 删除 only|signs，锚定语言后缀。
+
+[ ] 覆盖率 0.9 + 逐条检查。
+
+[ ] 重试只针对 429/5xx/超时；max_tokens；批次二分。
+
+[ ] 系统 LLM 走 get_runtime_setting/LLMHelper。
+
+[ ] 编码检测，禁用 errors="ignore"。
+
+[ ] 季包 debounce + 跨进程文件锁。
+
+[ ] API 路径 allowlist。
+
+[ ] pyproject.toml + ruff pin + CI matrix + tag/release。
+
+[ ] 契约测试：真实 MoviePilot + 假 Prowlarr + 黄金字幕。
+
+
+
+  审查基线：f20bf13 · 2026-08-16 · 对照 MoviePilot v3.1.9 / v2.14.0
+  生成于 2026-10-23 · 静态审查，未接入真实 Prowlarr 实例
